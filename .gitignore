@@ -1,0 +1,15 @@
+# Ignore Python cache and build artifacts
+__pycache__/
+*.py[cod]
+
+# Ignore virtual environments
+env/
+venv/
+.venv/
+
+# Ignore temporary and system files
+*.log
+.DS_Store
+
+# Ignore Docker data
+docker-data/
