@@ -1,0 +1,8 @@
+[core]
+    remote = minio_remote
+['remote "minio_remote"']
+    url = s3://raw-landing/dvc
+    endpointurl = http://localhost:9000
+    access_key_id = minio_admin_user
+    secret_access_key = super_secure_minio_pass_2026
+    ssl_verify = false
