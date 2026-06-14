@@ -6,6 +6,7 @@ __pycache__/
 env/
 venv/
 .venv/
+.env
 
 # Ignore temporary and system files
 *.log
