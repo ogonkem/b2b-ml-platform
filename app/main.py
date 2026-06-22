@@ -4,10 +4,18 @@ from typing import Dict, Any, Optional
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from fastapi import FastAPI, HTTPException, Security, status
+from fastapi import FastAPI, HTTPException, Security, status, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 import pickle, json, os
+import hmac, hashlib
+import redis
+from datetime import datetime
+import clickhouse_connect
+import uuid
+from minio import Minio
+from io import BytesIO
+from app.model_manager import ModelManager
 
 # Align local paths for imports
 root_path = Path(__file__).resolve().parent.parent
@@ -22,6 +30,28 @@ app = FastAPI(
     description="Production API endpoint for processing dynamic loan configurations and calculating risk defaults."
 )
 security_scheme = HTTPBearer(auto_error=False)
+
+# -------------------------------------------------------------------------
+# AUTHENTICATION
+# -------------------------------------------------------------------------
+
+VALID_TOKENS = set(os.environ.get("API_TOKENS", "dev-token").split(","))
+
+def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Security(security_scheme)):
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication scheme. Use Bearer token.",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    token = credentials.credentials
+    if token not in VALID_TOKENS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid or missing API token."
+        )
+    
+    return token
 
 
 # -------------------------------------------------------------------------
@@ -110,6 +140,103 @@ else:
     print("⚠️  Running in development mode — using mock model and pipeline")
     print("   Set USE_REAL_ARTEFACTS=true (or in .env) to load real artefacts")
 
+# ── ModelManager — start AFTER model is loaded ────────────────────────────
+# Only polls MLflow when real artefacts are in use
+# In dev mode it starts but load_latest() will find nothing and skip cleanly
+
+model_manager = ModelManager(
+    model_name="selastone_credit_scorer",
+    poll_interval=int(os.environ.get("MODEL_POLL_INTERVAL", 60))
+)
+model_manager.load_latest()    # try immediately on startup
+model_manager.start_polling()  # background thread checks every 60s
+
+# -------------------------------------------------------------------------
+# Redis client initialization (for future stateful features like caching or rate limiting)
+# -------------------------------------------------------------------------
+redis_client = redis.Redis(
+    host=os.environ.get("REDIS_HOST", "localhost"),
+    port=int(os.environ.get("REDIS_PORT", 6379)),
+    decode_responses=True
+)
+
+def check_and_increment_quota(tenant_id: str, monthly_limit: int = 1000):
+    """
+    Increments this tenant's monthly prediction counter in Redis.
+    (fixed window approach for simplicity: counts per calendar month, resets automatically with TTL)
+    Key resets automatically after ~1 month via TTL.
+    Raises 429 if limit exceeded.
+    """
+    key = f"quota:{tenant_id}:{datetime.utcnow().strftime('%Y_%m')}"
+    current = redis_client.incr(key)
+    if current == 1:
+        # New key created, set TTL to expire after ~1 month to reset quota automatically
+        redis_client.expire(key, 60 * 60 * 24 * 32)  # ~1 month TTL
+    if current > monthly_limit:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS, 
+            detail="Monthly prediction quota exceeded"
+        )
+    return current
+
+# -------------------------------------------------------------------------
+# ClickHouse client initialization (for future logging of predictions and usage)
+# -------------------------------------------------------------------------
+ch_client = None
+
+def get_ch_client():
+    """Lazy ClickHouse connection — only connects when first needed."""
+    global ch_client
+    if ch_client is None:
+        try:
+            import clickhouse_connect
+            ch_client = clickhouse_connect.get_client(
+                host=os.environ.get("CLICKHOUSE_HOST", "localhost"),
+                port=int(os.environ.get("CLICKHOUSE_PORT", 8123)),
+            )
+            ch_client.command("""
+                CREATE TABLE IF NOT EXISTS prediction_logs (
+                    tenant_id      String,
+                    application_id Int64,
+                    probability    Float32,
+                    prediction     Int8,
+                    model_version  String,
+                    ts             DateTime DEFAULT now()
+                ) ENGINE = MergeTree()
+                ORDER BY (tenant_id, ts)
+            """)
+            print("✓ ClickHouse connected")
+        except Exception as e:
+            print(f"⚠️  ClickHouse unavailable: {e}")
+            ch_client = None
+    return ch_client
+
+
+def log_prediction(tenant_id, app_id, prob, pred, model_version="v1"):
+    client = get_ch_client()
+    if client is None:
+        print(f"[WARNING] ClickHouse not available — skipping log app_id={app_id}")
+        return
+    try:
+        client.insert(
+            "prediction_logs",
+            [[tenant_id, app_id, prob, pred, model_version]],
+            column_names=["tenant_id", "application_id", "probability",
+                          "prediction", "model_version"]
+        )
+    except Exception as e:
+        print(f"[WARNING] ClickHouse logging failed: {e}")
+
+# --------------------------------------------------------------------------   
+# MinIO client initialization (for future model artefact storage and retrieval)
+# -------------------------------------------------------------------------
+minio_client = Minio(
+    f"{os.environ.get('MINIO_HOST', 'localhost')}:{os.environ.get('MINIO_PORT', 9000)}",
+    access_key=os.environ.get("MINIO_ROOT_USER"),
+    secret_key=os.environ.get("MINIO_ROOT_PASSWORD"),
+    secure=False
+)
+
 
 # -------------------------------------------------------------------------
 # ENDPOINTS
@@ -124,6 +251,8 @@ async def predict_default(
     payload: LoanApplication,
     token: Optional[HTTPAuthorizationCredentials] = Security(security_scheme)
 ):
+    tenant = verify_token(token)
+    check_and_increment_quota(tenant)
     try:
         # Convert incoming JSON payload to a pandas DataFrame
         input_data = pd.DataFrame([payload.model_dump()])
@@ -134,6 +263,14 @@ async def predict_default(
         # Calculate raw probability score and concrete decisions
         probability = float(xgb_model.predict_proba(transformed_features)[0, 1])
         prediction = int(xgb_model.predict(transformed_features)[0])
+
+        # Log the prediction event in ClickHouse for future analysis
+        log_prediction(
+            tenant_id=tenant, 
+            app_id=payload.ID, 
+            prob=probability, 
+            pred=prediction
+        )
         
         return {
             "application_id": payload.ID,
@@ -147,6 +284,57 @@ async def predict_default(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Pipeline execution failure: {str(e)}"
         )
+    
+@app.post("/v1/batch/upload")
+async def batch_upload(
+    file: UploadFile = File(...),
+    token: Optional[HTTPAuthorizationCredentials] = Security(security_scheme)
+):
+    tenant = verify_token(token)
+
+    content = await file.read()
+
+    # Validate file content checks
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="CSV file is empty")
+
+    try:
+        df = pd.read_csv(BytesIO(content))
+        row_count = len(df)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid CSV file")
+    
+    # empty file check
+    if row_count == 0:
+        raise HTTPException(status_code=400, detail="CSV file has no rows")
+
+    # Check and increment tenant's monthly quota
+    check_and_increment_quota(tenant, row_count)
+
+    # Write to MinIO
+    job_id = str(uuid.uuid4())
+    object_name = f"{tenant}/{datetime.utcnow().strftime('%Y%m%d')}/{job_id}.csv"
+
+    try:
+        minio_client.put_object(
+            "raw-landing", object_name,
+            data=BytesIO(content),
+            length=len(content),
+            content_type="text/csv"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to upload to MinIO: {str(e)}"
+        )
+
+    return {
+        "job_id":         job_id,
+        "tenant_id":      tenant,
+        "rows_received":  row_count,
+        "object":         object_name,
+        "status":         "queued"
+    }
 
 @app.get("/health", status_code=status.HTTP_200_OK, summary="Health Check API")
 async def health_check():

@@ -73,7 +73,8 @@ services:
       test: ["CMD", "curl", "-f", "http://localhost:8123/ping"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10         # ← more retries
+      start_period: 30s   # ← wait 30s before first check
 
   # ── ML Experiment Tracking (MLflow) ───────────────────────────────────────
   # Tracks all training runs, metrics, and promotes best model to Production
@@ -95,8 +96,9 @@ services:
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000"]
       interval: 15s
-      timeout: 5s
-      retries: 5
+      timeout: 10s
+      retries: 10
+      start_period: 60s   # ← give MLflow 60s before first check
 
   # ── DAG Scheduling (Airflow) ───────────────────────────────────────────────
   # Triggers weekly retraining pipeline: dvc checkout → train → mlflow promote
@@ -145,9 +147,7 @@ services:
       redis:
         condition: service_healthy
       clickhouse:
-        condition: service_healthy
-      mlflow:
-        condition: service_healthy
+        condition: service_started   # ← API can start before ClickHouse is fully healthy
     networks:
       - backend-network
     healthcheck:
