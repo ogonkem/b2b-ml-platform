@@ -63,10 +63,12 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:latest
     container_name: analytics-clickhouse
+    env_file:
+      - .env
     ports:
       - "8123:8123"
     volumes:
-      - ./docker-data/clickhouse:/var/lib/clickhouse
+      - clickhouse-data:/var/lib/clickhouse    # ← named volume, not bind mount
     networks:
       - backend-network
     healthcheck:
@@ -87,7 +89,12 @@ services:
       - .env
     ports:
       - "5000:5000"
-    command: mlflow server --host 0.0.0.0 --port 5000
+    command: >
+      mlflow server 
+      --host 0.0.0.0 
+      --port 5000
+      --allowed-hosts "mlflow,mlflow:5000,localhost,localhost:5000,*"
+      --default-artifact-root s3://mlflow-artifacts/
     depends_on:
       minio:
         condition: service_healthy
@@ -111,7 +118,7 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ./airflow-dags:/opt/airflow/dags
+      - ./airflow_dags:/opt/airflow/dags
     depends_on:
       postgres:
         condition: service_healthy
@@ -156,6 +163,32 @@ services:
       timeout: 5s
       retries: 3
 
+  # ── Observability Stack (Prometheus + Grafana) ─────────────────────────────
+  # Prometheus scrapes metrics from API, Redis, and ClickHouse
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: obs-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - backend-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: obs-grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - clickhouse
+    networks:
+      - backend-network
+
 networks:
   backend-network:
     driver: bridge
+
+volumes:
+  clickhouse-data:

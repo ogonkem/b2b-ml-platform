@@ -15,7 +15,10 @@ import clickhouse_connect
 import uuid
 from minio import Minio
 from io import BytesIO
+from prometheus_client import Counter, Histogram, make_asgi_app
+import time
 from app.model_manager import ModelManager
+
 
 # Align local paths for imports
 root_path = Path(__file__).resolve().parent.parent
@@ -30,6 +33,36 @@ app = FastAPI(
     description="Production API endpoint for processing dynamic loan configurations and calculating risk defaults."
 )
 security_scheme = HTTPBearer(auto_error=False)
+
+# -------------------------------------------------------------------------
+# prometheus metrics
+# -------------------------------------------------------------------------
+PREDICTIONS_TOTAL  = Counter(
+    "predictions_total",
+    "Total predictions made",
+    ["tenant_id", "prediction"]
+)
+PREDICTION_LATENCY = Histogram(
+    "prediction_latency_seconds",
+    "Prediction request latency"
+)
+BATCH_UPLOADS_TOTAL = Counter(          
+    "batch_uploads_total",
+    "Total batch CSV uploads",
+    ["tenant_id", "status"]            
+)
+BATCH_ROWS_TOTAL = Counter(             
+    "batch_rows_total",
+    "Total rows received via batch upload",
+    ["tenant_id"]
+)
+BATCH_UPLOAD_LATENCY = Histogram(       
+    "batch_upload_latency_seconds",
+    "Batch upload request latency"
+)
+
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
 
 # -------------------------------------------------------------------------
 # AUTHENTICATION
@@ -105,7 +138,7 @@ if USE_REAL_ARTEFACTS:
     PIPELINE_PATH = os.environ.get("PIPELINE_PATH", "models/feature_pipeline.pkl")
 
     with open(MODEL_PATH, 'rb') as f:
-        xgb_model = pickle.load(f)
+        pred_model = pickle.load(f)
 
     with open(PIPELINE_PATH, 'rb') as f:
         feature_pipeline = pickle.load(f)
@@ -132,10 +165,10 @@ else:
     })
     feature_pipeline.fit(baseline_historical_df, target_col='Status')
 
-    xgb_model = xgb.XGBClassifier()
+    pred_model = xgb.XGBClassifier()
     mock_y = np.array([0, 1, 0])
     mock_X = feature_pipeline.transform(baseline_historical_df)
-    xgb_model.fit(mock_X, mock_y)
+    pred_model.fit(mock_X, mock_y)
 
     print("⚠️  Running in development mode — using mock model and pipeline")
     print("   Set USE_REAL_ARTEFACTS=true (or in .env) to load real artefacts")
@@ -144,12 +177,16 @@ else:
 # Only polls MLflow when real artefacts are in use
 # In dev mode it starts but load_latest() will find nothing and skip cleanly
 
-model_manager = ModelManager(
-    model_name="selastone_credit_scorer",
-    poll_interval=int(os.environ.get("MODEL_POLL_INTERVAL", 60))
-)
-model_manager.load_latest()    # try immediately on startup
-model_manager.start_polling()  # background thread checks every 60s
+try:
+    model_manager = ModelManager(
+        model_name="selastone_credit_scorer",
+        poll_interval=int(os.environ.get("MODEL_POLL_INTERVAL", 60))
+    )
+    model_manager.start_polling()  # ← background thread only, don't call load_latest() here
+    print("✓ ModelManager polling started")
+except Exception as e:
+    print(f"⚠️  ModelManager failed to start: {e}")
+    model_manager = None
 
 # -------------------------------------------------------------------------
 # Redis client initialization (for future stateful features like caching or rate limiting)
@@ -193,6 +230,8 @@ def get_ch_client():
             ch_client = clickhouse_connect.get_client(
                 host=os.environ.get("CLICKHOUSE_HOST", "localhost"),
                 port=int(os.environ.get("CLICKHOUSE_PORT", 8123)),
+                username=os.environ.get("CLICKHOUSE_USER", "default"),
+                password=os.environ.get("CLICKHOUSE_PASSWORD", ""),
             )
             ch_client.command("""
                 CREATE TABLE IF NOT EXISTS prediction_logs (
@@ -253,6 +292,8 @@ async def predict_default(
 ):
     tenant = verify_token(token)
     check_and_increment_quota(tenant)
+
+    start = time.time() # start timer
     try:
         # Convert incoming JSON payload to a pandas DataFrame
         input_data = pd.DataFrame([payload.model_dump()])
@@ -261,17 +302,27 @@ async def predict_default(
         transformed_features = feature_pipeline.transform(input_data)
         
         # Calculate raw probability score and concrete decisions
-        probability = float(xgb_model.predict_proba(transformed_features)[0, 1])
-        prediction = int(xgb_model.predict(transformed_features)[0])
+        probability = float(pred_model.predict_proba(transformed_features)[0, 1])
+        prediction = int(pred_model.predict(transformed_features)[0])
+
+        # RECORD LATENCY and INCREMENT COUNTER
+        PREDICTION_LATENCY.observe(time.time() - start) 
+        PREDICTIONS_TOTAL.labels(
+            tenant_id=tenant,
+            prediction=str(prediction)
+        ).inc()
 
         # Log the prediction event in ClickHouse for future analysis
-        log_prediction(
-            tenant_id=tenant, 
-            app_id=payload.ID, 
-            prob=probability, 
-            pred=prediction
-        )
-        
+        try:
+            log_prediction(
+                tenant_id=tenant, 
+                app_id=payload.ID, 
+                prob=probability, 
+                pred=prediction
+            )
+        except Exception as log_err:
+            print(f"[WARNING] Logging failed: {log_err}")
+
         return {
             "application_id": payload.ID,
             "default_prediction": prediction,
@@ -280,6 +331,7 @@ async def predict_default(
         }
         
     except Exception as e:
+        PREDICTION_LATENCY.observe(time.time() - start)  # RECORD LATENCY even on failure
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Pipeline execution failure: {str(e)}"
@@ -292,24 +344,33 @@ async def batch_upload(
 ):
     tenant = verify_token(token)
 
+    start = time.time()
+
     content = await file.read()
 
     # Validate file content checks
     if len(content) == 0:
+        BATCH_UPLOADS_TOTAL.labels(tenant_id=tenant, status="invalid").inc()   # ← track
         raise HTTPException(status_code=400, detail="CSV file is empty")
 
     try:
         df = pd.read_csv(BytesIO(content))
         row_count = len(df)
     except Exception:
+        BATCH_UPLOADS_TOTAL.labels(tenant_id=tenant, status="invalid").inc()   # ← track
         raise HTTPException(status_code=400, detail="Invalid CSV file")
     
     # empty file check
     if row_count == 0:
+        BATCH_UPLOADS_TOTAL.labels(tenant_id=tenant, status="invalid").inc()   # ← track
         raise HTTPException(status_code=400, detail="CSV file has no rows")
 
     # Check and increment tenant's monthly quota
-    check_and_increment_quota(tenant, row_count)
+    try:
+        check_and_increment_quota(tenant, row_count)
+    except Exception:
+        BATCH_UPLOADS_TOTAL.labels(tenant_id=tenant, status="quota_exceeded").inc()  # ← track
+        raise HTTPException(status_code=429, detail="Quota exceeded")
 
     # Write to MinIO
     job_id = str(uuid.uuid4())
@@ -323,10 +384,17 @@ async def batch_upload(
             content_type="text/csv"
         )
     except Exception as e:
+        BATCH_UPLOADS_TOTAL.labels(tenant_id=tenant, status="minio_error").inc()    # ← track
+        BATCH_UPLOAD_LATENCY.observe(time.time() - start)   
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to upload to MinIO: {str(e)}"
         )
+
+    # ── All good — record success metrics ─────────────────────────────────────
+    BATCH_UPLOADS_TOTAL.labels(tenant_id=tenant, status="success").inc()        # ← track
+    BATCH_ROWS_TOTAL.labels(tenant_id=tenant).inc(row_count)                    # ← track
+    BATCH_UPLOAD_LATENCY.observe(time.time() - start)                           # ← track
 
     return {
         "job_id":         job_id,
@@ -338,6 +406,10 @@ async def batch_upload(
 
 @app.get("/health", status_code=status.HTTP_200_OK, summary="Health Check API")
 async def health_check():
-    return {"status": "healthy", "pipeline_fitted": feature_pipeline.is_fitted}
+    return {
+        "status": "healthy", 
+        "pipeline_fitted": feature_pipeline.is_fitted,
+        "model_version":    str(model_manager.version or "dev"),   # ← add version
+    }
 
 

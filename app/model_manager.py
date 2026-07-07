@@ -29,35 +29,39 @@ class ModelManager:
     @property
     def model_name(self) -> str:
         return self._model_name
+    
+    @property
+    def version(self):
+        return self._version
 
     def load_latest(self):
-        """Load the latest Production version of the model from MLflow."""
         try:
-            versions = self._client.get_latest_versions(
-                self.model_name, stages=["Production"]
+            import mlflow.pyfunc
+            # New API — replaces deprecated get_latest_versions
+            versions = self._client.search_model_versions(
+                f"name='{self.model_name}'"
             )
-        except Exception as e:
-            print(f"[ModelManager] MLflow unreachable: {e}")
-            return   # ← must return, not raise
+            production = [v for v in versions if v.current_stage == "Production"]
+            
+            if not production:
+                return
 
-        if not versions:
-            return
+            latest = max(production, key=lambda v: int(v.version))
 
-        latest = versions[0]
-        if latest.version == self._version:
-            return
+            if latest.version == self._version:
+                return
 
-        try:
             new_model = mlflow.pyfunc.load_model(
                 f"models:/{self.model_name}/Production"
             )
             with self._lock:
                 self._model   = new_model
                 self._version = latest.version
-        except Exception as e:
-            print(f"[ModelManager] Failed to load: {e}")
-            # do NOT update _model or _version — keep old ones
+            print(f"[ModelManager] ✓ Hot-swapped to v{self._version}")
 
+        except Exception as e:
+            print(f"[ModelManager] load_latest error: {e}")
+            
     def predict_proba(self, X):
         """Thread-safe prediction using the latest model."""
         with self._lock:
