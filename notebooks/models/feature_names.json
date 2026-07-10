@@ -1,9 +1,6 @@
 [
   "year",
   "loan_amount",
-  "rate_of_interest",
-  "Interest_rate_spread",
-  "Upfront_charges",
   "term",
   "property_value",
   "income",
