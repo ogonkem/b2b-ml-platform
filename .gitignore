@@ -17,3 +17,4 @@ docker-data/
 
 # others
 interview_prep.md
+notebooks/models/*.pkl
