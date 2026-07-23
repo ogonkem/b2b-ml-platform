@@ -1,6 +1,11 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
+
+# Build tools required by shap (C extensions) and other compiled packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc g++ && \
+    rm -rf /var/lib/apt/lists/*
 
 # Install dependencies
 COPY requirements.txt .
@@ -9,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source code
 COPY app/ ./app/
 COPY shared/ ./shared/
+COPY celery_worker/ ./celery_worker/
 
 # Run uvicorn
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

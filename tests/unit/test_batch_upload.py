@@ -199,3 +199,96 @@ def test_minio_failure_returns_500():
         mock_minio.put_object.side_effect = Exception("MinIO connection refused")
         response = upload()
     assert response.status_code == 500
+
+
+# ── Redis job tracking (added with Celery integration) ────────────────────────
+
+def test_redis_job_status_set_to_queued_after_upload():
+    with patch("app.main.check_and_increment_quota", return_value=5), \
+         patch("app.main.minio_client") as mock_minio, \
+         patch("app.main.redis_client") as mock_redis, \
+         patch("app.main._celery_app", None):
+        mock_minio.bucket_exists.return_value = True
+        mock_minio.put_object.return_value    = None
+        mock_redis.set.return_value           = True
+        upload()
+    status_calls = [c for c in mock_redis.set.call_args_list if "status" in str(c)]
+    assert any("queued" in str(c) for c in status_calls)
+
+def test_redis_tenant_recorded_after_upload():
+    with patch("app.main.check_and_increment_quota", return_value=5), \
+         patch("app.main.minio_client") as mock_minio, \
+         patch("app.main.redis_client") as mock_redis, \
+         patch("app.main._celery_app", None):
+        mock_minio.bucket_exists.return_value = True
+        mock_minio.put_object.return_value    = None
+        mock_redis.set.return_value           = True
+        upload()
+    tenant_calls = [c for c in mock_redis.set.call_args_list if "tenant" in str(c)]
+    assert len(tenant_calls) == 1
+
+def test_celery_send_task_called_on_success():
+    mock_celery = MagicMock()
+    with patch("app.main.check_and_increment_quota", return_value=5), \
+         patch("app.main.minio_client") as mock_minio, \
+         patch("app.main.redis_client") as mock_redis, \
+         patch("app.main._celery_app", mock_celery):
+        mock_minio.bucket_exists.return_value = True
+        mock_minio.put_object.return_value    = None
+        mock_redis.set.return_value           = True
+        upload()
+    mock_celery.send_task.assert_called_once()
+
+def test_celery_task_name_is_process_batch():
+    mock_celery = MagicMock()
+    with patch("app.main.check_and_increment_quota", return_value=5), \
+         patch("app.main.minio_client") as mock_minio, \
+         patch("app.main.redis_client") as mock_redis, \
+         patch("app.main._celery_app", mock_celery):
+        mock_minio.bucket_exists.return_value = True
+        mock_minio.put_object.return_value    = None
+        mock_redis.set.return_value           = True
+        upload()
+    task_name = mock_celery.send_task.call_args[0][0]
+    assert task_name == "process_batch"
+
+def test_celery_kwargs_contain_job_id_and_tenant():
+    mock_celery = MagicMock()
+    with patch("app.main.check_and_increment_quota", return_value=5), \
+         patch("app.main.minio_client") as mock_minio, \
+         patch("app.main.redis_client") as mock_redis, \
+         patch("app.main._celery_app", mock_celery):
+        mock_minio.bucket_exists.return_value = True
+        mock_minio.put_object.return_value    = None
+        mock_redis.set.return_value           = True
+        upload()
+    kwargs = mock_celery.send_task.call_args[1]["kwargs"]
+    assert "job_id"      in kwargs
+    assert "tenant_id"   in kwargs
+    assert "object_name" in kwargs
+
+def test_upload_succeeds_even_when_celery_raises():
+    """Celery broker failure must not fail the upload — status is still queued."""
+    mock_celery = MagicMock()
+    mock_celery.send_task.side_effect = Exception("broker down")
+    with patch("app.main.check_and_increment_quota", return_value=5), \
+         patch("app.main.minio_client") as mock_minio, \
+         patch("app.main.redis_client") as mock_redis, \
+         patch("app.main._celery_app", mock_celery):
+        mock_minio.bucket_exists.return_value = True
+        mock_minio.put_object.return_value    = None
+        mock_redis.set.return_value           = True
+        response = upload()
+    assert response.status_code == 200
+    assert response.json()["status"] == "queued"
+
+def test_minio_raw_landing_bucket_created_if_missing():
+    with patch("app.main.check_and_increment_quota", return_value=5), \
+         patch("app.main.minio_client") as mock_minio, \
+         patch("app.main.redis_client") as mock_redis, \
+         patch("app.main._celery_app", None):
+        mock_minio.bucket_exists.return_value = False
+        mock_minio.put_object.return_value    = None
+        mock_redis.set.return_value           = True
+        upload()
+    mock_minio.make_bucket.assert_called_once_with("raw-landing")

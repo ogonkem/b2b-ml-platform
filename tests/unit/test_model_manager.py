@@ -54,20 +54,21 @@ def test_is_loaded_false_when_no_model(manager):
 # ── load_latest ───────────────────────────────────────────────────────────────
 
 def test_load_latest_no_production_version(manager):
-    manager._client.get_latest_versions.return_value = []
+    # search_model_versions returns versions but none in Production stage
+    manager._client.search_model_versions.return_value = []
     manager.load_latest()
     assert manager._model is None
 
 def test_load_latest_mlflow_unreachable(manager):
-    manager._client.get_latest_versions.side_effect = Exception("Connection refused")
+    manager._client.search_model_versions.side_effect = Exception("Connection refused")
     manager.load_latest()
     assert manager._model is None
 
 def test_load_latest_loads_new_version(manager):
     mock_version = MagicMock()
-    mock_version.version = "3"
-    mock_version.description = "RF AUC=0.91"
-    manager._client.get_latest_versions.return_value = [mock_version]
+    mock_version.version       = "3"
+    mock_version.current_stage = "Production"   # required by the stage filter
+    manager._client.search_model_versions.return_value = [mock_version]
 
     mock_model = MagicMock()
     with patch("app.model_manager.mlflow.pyfunc.load_model", return_value=mock_model):
@@ -78,8 +79,9 @@ def test_load_latest_loads_new_version(manager):
 
 def test_load_latest_skips_same_version(manager):
     mock_version = MagicMock()
-    mock_version.version = "3"
-    manager._client.get_latest_versions.return_value = [mock_version]
+    mock_version.version       = "3"
+    mock_version.current_stage = "Production"
+    manager._client.search_model_versions.return_value = [mock_version]
     manager._version = "3"
 
     with patch("app.model_manager.mlflow.pyfunc.load_model") as mock_load:
@@ -88,8 +90,9 @@ def test_load_latest_skips_same_version(manager):
 
 def test_load_latest_swaps_to_newer_version(manager):
     mock_v4 = MagicMock()
-    mock_v4.version = "4"
-    manager._client.get_latest_versions.return_value = [mock_v4]
+    mock_v4.version       = "4"
+    mock_v4.current_stage = "Production"
+    manager._client.search_model_versions.return_value = [mock_v4]
     manager._version = "3"
 
     mock_model = MagicMock()
@@ -104,8 +107,9 @@ def test_load_latest_download_fails_keeps_old_model(manager):
     manager._version = "3"
 
     mock_v4 = MagicMock()
-    mock_v4.version = "4"
-    manager._client.get_latest_versions.return_value = [mock_v4]
+    mock_v4.version       = "4"
+    mock_v4.current_stage = "Production"
+    manager._client.search_model_versions.return_value = [mock_v4]
 
     with patch("app.model_manager.mlflow.pyfunc.load_model",
                side_effect=Exception("Download failed")):
@@ -116,8 +120,9 @@ def test_load_latest_download_fails_keeps_old_model(manager):
 
 def test_is_loaded_true_after_load(manager):
     mock_v = MagicMock()
-    mock_v.version = "1"
-    manager._client.get_latest_versions.return_value = [mock_v]
+    mock_v.version       = "1"
+    mock_v.current_stage = "Production"
+    manager._client.search_model_versions.return_value = [mock_v]
     with patch("app.model_manager.mlflow.pyfunc.load_model", return_value=MagicMock()):
         manager.load_latest()
     assert manager.is_loaded is True

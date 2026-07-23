@@ -16,15 +16,17 @@ annotated-types==0.7.0
 
 # ── ML + Explainability (SHAP for compliance) ─────────────────────────────────
 xgboost==3.2.0
+lightgbm==4.6.0
 scikit-learn==1.8.0
 numpy==2.4.6
 pandas==2.3.3
 joblib==1.5.3
 scipy==1.17.1
 threadpoolctl==3.6.0
-shap                        # Explainability — SHAP values per prediction
+shap==0.52.0                # Explainability — SHAP values per prediction
 
 # ── Storage / messaging ───────────────────────────────────────────────────────
+celery==5.4.0              # Async batch scoring worker — broker: Redis
 redis==8.0.0
 clickhouse-connect==0.8.10  # Auditability — prediction audit logs
 minio==7.2.15               # Privacy — batch upload to isolated tenant storage

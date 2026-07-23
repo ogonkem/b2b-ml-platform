@@ -163,6 +163,27 @@ services:
       timeout: 5s
       retries: 3
 
+  # ── Async Batch Scoring Worker (Celery) ──────────────────────────────────
+  # Reads raw CSVs from MinIO raw-landing, scores every row, writes
+  # results CSVs to MinIO batch-results, updates job status in Redis.
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: selastone-celery
+    env_file:
+      - .env
+    volumes:
+      - ./notebooks/models:/models:ro
+    command: celery -A celery_worker.tasks worker --loglevel=info --concurrency=2
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - backend-network
+
   # ── Observability Stack (Prometheus + Grafana) ─────────────────────────────
   # Prometheus scrapes metrics from API, Redis, and ClickHouse
   prometheus:

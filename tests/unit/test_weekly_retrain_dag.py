@@ -29,10 +29,10 @@ def test_dag_has_three_tasks():
     assert len(mod.dag.tasks) == 3
 
 def test_dag_task_order():
-    """dvc_checkout → train_model → promote_model."""
+    """sync_data → train_model → promote_model."""
     mod = load_dag()
     task_ids = [t.task_id for t in mod.dag.topological_sort()]
-    assert task_ids == ["dvc_checkout", "train_model", "promote_model"]
+    assert task_ids == ["sync_data", "train_model", "promote_model"]
 
 def test_dag_schedule():
     mod = load_dag()

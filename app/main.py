@@ -7,10 +7,10 @@ import xgboost as xgb
 from fastapi import FastAPI, HTTPException, Security, status, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
-import pickle, json, os
+import pickle, os
 import hmac, hashlib
 import redis
-from datetime import datetime
+from datetime import datetime, timedelta
 import clickhouse_connect
 import uuid
 from minio import Minio
@@ -18,6 +18,11 @@ from io import BytesIO
 from prometheus_client import Counter, Histogram, make_asgi_app
 import time
 from app.model_manager import ModelManager
+
+try:
+    from celery_worker.celery_app import celery_app as _celery_app
+except ImportError:
+    _celery_app = None
 
 
 # Align local paths for imports
@@ -88,7 +93,7 @@ def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Security(
 
 
 # -------------------------------------------------------------------------
-# PYDANTIC INPUT DATA SCHEMA
+# PYDANTIC SCHEMAS
 # -------------------------------------------------------------------------
 class LoanApplication(BaseModel):
     ID: int = Field(..., example=24896)
@@ -125,6 +130,14 @@ class LoanApplication(BaseModel):
     Security_Type: Optional[str] = "direct"
     dtir1: Optional[float] = 44.0
 
+
+class LabeledDataSchema(BaseModel):
+    """Returned by POST /v1/labeled-data after the business uploads actuals."""
+    object:        str
+    tenant_id:     str
+    rows_received: int
+    status:        str
+
 # -------------------------------------------------------------------------
 # GLOBAL SERVICE INITIALIZATION
 # -------------------------------------------------------------------------
@@ -139,12 +152,11 @@ if USE_REAL_ARTEFACTS:
 
     with open(MODEL_PATH, 'rb') as f:
         pred_model = pickle.load(f)
-
     with open(PIPELINE_PATH, 'rb') as f:
         feature_pipeline = pickle.load(f)
 
     print(f"✓ Loaded real model    → {MODEL_PATH}")
-    print(f"✓ Loaded real pipeline → {PIPELINE_PATH}")
+    print(f"✓ Loaded real pipeline → {PIPELINE_PATH} ({len(feature_pipeline.feature_names)} features)")
 
 else:
     # ── Development mode: dry-fit on baseline dummy data ──────────────────
@@ -197,21 +209,21 @@ redis_client = redis.Redis(
     decode_responses=True
 )
 
-def check_and_increment_quota(tenant_id: str, monthly_limit: int = 1000):
+def check_and_increment_quota(tenant_id: str, increment: int = 1, monthly_limit: int = 1000):
     """
-    Increments this tenant's monthly prediction counter in Redis.
-    (fixed window approach for simplicity: counts per calendar month, resets automatically with TTL)
-    Key resets automatically after ~1 month via TTL.
-    Raises 429 if limit exceeded.
+    Increments this tenant's monthly row counter by `increment`.
+    For /v1/predict pass increment=1 (default).
+    For /v1/batch/upload pass increment=row_count so bulk jobs consume quota fairly.
+    Raises 429 if the running total exceeds monthly_limit.
     """
     key = f"quota:{tenant_id}:{datetime.utcnow().strftime('%Y_%m')}"
-    current = redis_client.incr(key)
-    if current == 1:
-        # New key created, set TTL to expire after ~1 month to reset quota automatically
-        redis_client.expire(key, 60 * 60 * 24 * 32)  # ~1 month TTL
+    current = redis_client.incrby(key, increment)
+    if current <= increment:
+        # Key was just created (or reset); set ~1-month TTL for automatic reset
+        redis_client.expire(key, 60 * 60 * 24 * 32)
     if current > monthly_limit:
         raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS, 
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Monthly prediction quota exceeded"
         )
     return current
@@ -244,6 +256,15 @@ def get_ch_client():
                 ) ENGINE = MergeTree()
                 ORDER BY (tenant_id, ts)
             """)
+            ch_client.command("""
+                CREATE TABLE IF NOT EXISTS labeled_uploads (
+                    tenant_id      String,
+                    object_name    String,
+                    rows_received  Int32,
+                    ts             DateTime DEFAULT now()
+                ) ENGINE = MergeTree()
+                ORDER BY (tenant_id, ts)
+            """)
             print("✓ ClickHouse connected")
         except Exception as e:
             print(f"⚠️  ClickHouse unavailable: {e}")
@@ -265,6 +286,21 @@ def log_prediction(tenant_id, app_id, prob, pred, model_version="v1"):
         )
     except Exception as e:
         print(f"[WARNING] ClickHouse logging failed: {e}")
+
+
+def log_labeled_upload(tenant_id: str, object_name: str, rows: int):
+    """Audit trail: records every labeled CSV upload in ClickHouse."""
+    client = get_ch_client()
+    if client is None:
+        return
+    try:
+        client.insert(
+            "labeled_uploads",
+            [[tenant_id, object_name, rows]],
+            column_names=["tenant_id", "object_name", "rows_received"],
+        )
+    except Exception as e:
+        print(f"[WARNING] ClickHouse labeled-upload log failed: {e}")
 
 # --------------------------------------------------------------------------   
 # MinIO client initialization (for future model artefact storage and retrieval)
@@ -295,12 +331,8 @@ async def predict_default(
 
     start = time.time() # start timer
     try:
-        # Convert incoming JSON payload to a pandas DataFrame
-        input_data = pd.DataFrame([payload.model_dump()])
-        
-        # Extract features through processing pipeline
-        transformed_features = feature_pipeline.transform(input_data)
-        
+        transformed_features = feature_pipeline.transform(pd.DataFrame([payload.model_dump()]))
+
         # Calculate raw probability score and concrete decisions
         probability = float(pred_model.predict_proba(transformed_features)[0, 1])
         prediction = int(pred_model.predict(transformed_features)[0])
@@ -377,6 +409,8 @@ async def batch_upload(
     object_name = f"{tenant}/{datetime.utcnow().strftime('%Y%m%d')}/{job_id}.csv"
 
     try:
+        if not minio_client.bucket_exists("raw-landing"):
+            minio_client.make_bucket("raw-landing")
         minio_client.put_object(
             "raw-landing", object_name,
             data=BytesIO(content),
@@ -384,32 +418,152 @@ async def batch_upload(
             content_type="text/csv"
         )
     except Exception as e:
-        BATCH_UPLOADS_TOTAL.labels(tenant_id=tenant, status="minio_error").inc()    # ← track
-        BATCH_UPLOAD_LATENCY.observe(time.time() - start)   
+        BATCH_UPLOADS_TOTAL.labels(tenant_id=tenant, status="minio_error").inc()
+        BATCH_UPLOAD_LATENCY.observe(time.time() - start)
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail=f"Failed to upload to MinIO: {str(e)}"
         )
 
-    # ── All good — record success metrics ─────────────────────────────────────
-    BATCH_UPLOADS_TOTAL.labels(tenant_id=tenant, status="success").inc()        # ← track
-    BATCH_ROWS_TOTAL.labels(tenant_id=tenant).inc(row_count)                    # ← track
-    BATCH_UPLOAD_LATENCY.observe(time.time() - start)                           # ← track
+    # ── Track job status in Redis so /v1/batch/results/{job_id} can poll it ──
+    redis_client.set(f"job:{job_id}:status", "queued", ex=86400)
+    redis_client.set(f"job:{job_id}:tenant", tenant,   ex=86400)
+
+    # ── Enqueue Celery scoring task ───────────────────────────────────────────
+    if _celery_app:
+        try:
+            _celery_app.send_task("process_batch", kwargs={
+                "job_id":      job_id,
+                "object_name": object_name,
+                "tenant_id":   tenant,
+            })
+        except Exception as e:
+            print(f"[WARNING] Celery enqueue failed for job {job_id}: {e}")
+
+    # ── Record success metrics ────────────────────────────────────────────────
+    BATCH_UPLOADS_TOTAL.labels(tenant_id=tenant, status="success").inc()
+    BATCH_ROWS_TOTAL.labels(tenant_id=tenant).inc(row_count)
+    BATCH_UPLOAD_LATENCY.observe(time.time() - start)
 
     return {
-        "job_id":         job_id,
-        "tenant_id":      tenant,
-        "rows_received":  row_count,
-        "object":         object_name,
-        "status":         "queued"
+        "job_id":        job_id,
+        "tenant_id":     tenant,
+        "rows_received": row_count,
+        "object":        object_name,
+        "status":        "queued"
     }
 
 @app.get("/health", status_code=status.HTTP_200_OK, summary="Health Check API")
 async def health_check():
     return {
-        "status": "healthy", 
-        "pipeline_fitted": feature_pipeline.is_fitted,
-        "model_version":    str(model_manager.version or "dev"),   # ← add version
+        "status":           "healthy",
+        "pipeline_fitted":  feature_pipeline.is_fitted,
+        "model_version":    str(model_manager.version or "dev"),
     }
+
+
+@app.get("/v1/batch/results/{job_id}", summary="Poll batch job status and retrieve results")
+async def batch_results(
+    job_id: str,
+    token:  Optional[HTTPAuthorizationCredentials] = Security(security_scheme),
+):
+    """
+    Returns the current status of a batch scoring job.
+    When status is 'complete', also returns a presigned MinIO download URL
+    (valid for 1 hour) pointing to the results CSV.
+    """
+    tenant = verify_token(token)
+
+    # Ownership check — tenants can only see their own jobs
+    job_tenant = redis_client.get(f"job:{job_id}:tenant")
+    if job_tenant is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job_tenant != tenant:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    job_status = redis_client.get(f"job:{job_id}:status")
+    response   = {"job_id": job_id, "status": job_status}
+
+    if job_status == "complete":
+        result_object = redis_client.get(f"job:{job_id}:result_object")
+        rows_scored   = redis_client.get(f"job:{job_id}:rows_scored")
+        download_url  = minio_client.presigned_get_object(
+            "batch-results", result_object, expires=timedelta(hours=1)
+        )
+        response.update({
+            "rows_scored":   int(rows_scored or 0),
+            "download_url":  download_url,
+        })
+
+    elif job_status == "failed":
+        response["error"] = redis_client.get(f"job:{job_id}:error")
+
+    return response
+
+
+@app.post(
+    "/v1/labeled-data",
+    response_model=LabeledDataSchema,
+    status_code=status.HTTP_200_OK,
+    summary="Upload labeled actuals CSV for drift detection and retraining",
+)
+async def upload_labeled_data(
+    file:  UploadFile = File(...),
+    token: Optional[HTTPAuthorizationCredentials] = Security(security_scheme),
+):
+    """
+    The business uploads a CSV containing actual loan outcomes (ground truth)
+    alongside the original feature columns.  The CSV must include either an
+    'actual_outcome' column (0 = no default, 1 = default) or a 'Status' column.
+
+    The file is stored in MinIO labeled-data bucket.  The daily ingestion DAG
+    pulls these CSVs, computes PSI drift against the training baseline, and —
+    if drift >= 0.2 — commits the labeled data to DVC so the weekly retrain
+    picks it up.
+    """
+    tenant = verify_token(token)
+
+    content = await file.read()
+
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="CSV file is empty")
+
+    try:
+        df = pd.read_csv(BytesIO(content))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid CSV file")
+
+    if len(df) == 0:
+        raise HTTPException(status_code=400, detail="CSV has no rows")
+
+    if "actual_outcome" not in df.columns and "Status" not in df.columns:
+        raise HTTPException(
+            status_code=400,
+            detail="CSV must contain an 'actual_outcome' or 'Status' column",
+        )
+
+    # Write to MinIO labeled-data bucket
+    upload_id   = str(uuid.uuid4())
+    object_name = f"{tenant}/{datetime.utcnow().strftime('%Y%m%d')}/{upload_id}_labeled.csv"
+
+    try:
+        if not minio_client.bucket_exists("labeled-data"):
+            minio_client.make_bucket("labeled-data")
+        minio_client.put_object(
+            "labeled-data", object_name,
+            data=BytesIO(content), length=len(content),
+            content_type="text/csv",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"MinIO write failed: {str(e)}")
+
+    log_labeled_upload(tenant, object_name, len(df))
+
+    return LabeledDataSchema(
+        object=object_name,
+        tenant_id=tenant,
+        rows_received=len(df),
+        status="stored",
+    )
 
 

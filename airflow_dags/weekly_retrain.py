@@ -25,20 +25,33 @@ with DAG(
     default_args=default_args,
 ) as dag:
 
-    def run_dvc_checkout():
-        """Ensure we're on the latest DVC-tracked data and code."""
-        subprocess.run(["dvc", "checkout"], check=True)
+    def sync_data():
+        """
+        Pull the latest git commits (including any .dvc pointer files committed
+        by the daily ingestion DAG when drift was detected) then download the
+        actual data files from DVC remote storage.
+
+        dvc checkout only restores files to match the local git state — it does
+        not fetch new .dvc pointers or download new data from remote.
+        dvc pull = dvc fetch + dvc checkout, and works on the latest git HEAD.
+        """
+        subprocess.run(["git", "pull", "--ff-only"], check=True)
+        subprocess.run(["dvc", "pull"],               check=True)
 
     def run_training():
-        """Run the model training script."""
+        """
+        Run the headless retraining script.  retrain.py checks for
+        notebooks/archive/feedback_labeled.csv — written by the ingestion DAG
+        when PSI drift >= 0.2 — and merges it with the baseline training data
+        before fitting the four candidate models.
+        """
         subprocess.run(
-            ["python", "notebooks/retrain.py"],   # headless version of notebook
+            ["python", "notebooks/retrain.py"],
             check=True
         )
 
-
     # Define tasks
-    t1 = PythonOperator(task_id="dvc_checkout",   python_callable=run_dvc_checkout)
+    t1 = PythonOperator(task_id="sync_data",      python_callable=sync_data)
     t2 = PythonOperator(task_id="train_model",    python_callable=run_training)
     t3 = PythonOperator(task_id="promote_model",  python_callable=promote_if_better)
 

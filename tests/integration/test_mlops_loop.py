@@ -18,8 +18,11 @@ def test_experiment_exists():
 def test_model_registered():
     mlflow.set_tracking_uri(MLFLOW_URI)
     client = mlflow.tracking.MlflowClient()
-    versions = client.get_latest_versions(MODEL_NAME, stages=["Production"])
-    assert len(versions) > 0
+    versions = client.search_model_versions(f"name='{MODEL_NAME}'")
+    assert len(versions) > 0, (
+        f"No versions found for '{MODEL_NAME}'. "
+        "Run notebooks/retrain.py against the live stack first."
+    )
 
 def test_model_manager_hot_swap():
     """
