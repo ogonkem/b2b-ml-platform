@@ -28,9 +28,9 @@ def promote_if_better():
     # Only promote if challenger is meaningfully better (>= 2% improvement)
     if challenger_auc >= champion_auc + 0.02:
         mv = client.create_model_version(
-            "selastone_credit_scorer",
-            challenger.info.run_id,
-            "model"
+            name="selastone_credit_scorer",
+            source=f"runs:/{challenger.info.run_id}/model",
+            run_id=challenger.info.run_id,
         )
         client.transition_model_version_stage(
             "selastone_credit_scorer", mv.version, "Production"

@@ -51,9 +51,20 @@ class ModelManager:
             if latest.version == self._version:
                 return
 
-            new_model = mlflow.pyfunc.load_model(
+            # mlflow.pyfunc.load_model() returns a generic PyFuncModel whose only
+            # guaranteed method is predict() — it has no predict_proba(). Pull out
+            # the native flavor object (XGBClassifier / LGBMClassifier / a sklearn
+            # estimator, depending on which model won this training cycle) so
+            # predict_proba below actually works.
+            pyfunc_model = mlflow.pyfunc.load_model(
                 f"models:/{self.model_name}/Production"
             )
+            new_model = pyfunc_model.get_raw_model()
+            if new_model is None or not hasattr(new_model, "predict_proba"):
+                raise RuntimeError(
+                    f"Production model v{latest.version} has no predict_proba-capable raw model"
+                )
+
             with self._lock:
                 self._model   = new_model
                 self._version = latest.version
@@ -61,11 +72,16 @@ class ModelManager:
 
         except Exception as e:
             print(f"[ModelManager] load_latest error: {e}")
-            
+
     def predict_proba(self, X):
         """Thread-safe prediction using the latest model."""
         with self._lock:
             return self._model.predict_proba(X)
+
+    def predict(self, X):
+        """Thread-safe binary prediction using the latest model."""
+        with self._lock:
+            return self._model.predict(X)
 
     def start_polling(self):
         """Start the polling thread."""

@@ -70,12 +70,32 @@ def test_load_latest_loads_new_version(manager):
     mock_version.current_stage = "Production"   # required by the stage filter
     manager._client.search_model_versions.return_value = [mock_version]
 
+    # mlflow.pyfunc.load_model() returns a generic PyFuncModel wrapper —
+    # ModelManager pulls the native (predict_proba-capable) model out via
+    # get_raw_model(), so that's what should end up in manager._model.
+    raw_model  = MagicMock()
     mock_model = MagicMock()
+    mock_model.get_raw_model.return_value = raw_model
     with patch("app.model_manager.mlflow.pyfunc.load_model", return_value=mock_model):
         manager.load_latest()
 
-    assert manager._model is mock_model
+    assert manager._model is raw_model
     assert manager._version == "3"
+
+def test_load_latest_skips_model_with_no_predict_proba(manager):
+    """A raw model that isn't predict_proba-capable must not get swapped in."""
+    mock_version = MagicMock()
+    mock_version.version       = "3"
+    mock_version.current_stage = "Production"
+    manager._client.search_model_versions.return_value = [mock_version]
+
+    mock_model = MagicMock()
+    mock_model.get_raw_model.return_value = None
+    with patch("app.model_manager.mlflow.pyfunc.load_model", return_value=mock_model):
+        manager.load_latest()
+
+    assert manager._model is None
+    assert manager._version is None
 
 def test_load_latest_skips_same_version(manager):
     mock_version = MagicMock()
@@ -152,6 +172,23 @@ def test_predict_proba_returns_model_output(manager):
 
     result = manager.predict_proba([[1, 2, 3]])
     assert result == [[0.58, 0.42]]
+
+
+# ── predict ───────────────────────────────────────────────────────────────────
+
+def test_predict_raises_if_no_model(manager):
+    with pytest.raises(Exception):
+        manager.predict([[1, 2, 3]])
+
+def test_predict_delegates_to_model(manager):
+    mock_model = MagicMock()
+    mock_model.predict.return_value = [1]
+    manager._model   = mock_model
+    manager._version = "3"
+
+    result = manager.predict([[1, 2, 3]])
+    mock_model.predict.assert_called_once_with([[1, 2, 3]])
+    assert result == [1]
 
 
 # ── Thread safety ─────────────────────────────────────────────────────────────

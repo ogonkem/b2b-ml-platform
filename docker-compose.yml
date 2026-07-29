@@ -111,14 +111,21 @@ services:
   # Triggers weekly retraining pipeline: dvc checkout → train → mlflow promote
   # UI → http://localhost:8080
   airflow:
-    image: apache/airflow:2.7.0-python3.10
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
     container_name: orchestrator-airflow
     env_file:
       - .env
+    working_dir: /opt/airflow/project
     ports:
       - "8080:8080"
     volumes:
-      - ./airflow_dags:/opt/airflow/dags
+      # Full repo, not just airflow_dags/ — the DAG tasks import shared/,
+      # invoke notebooks/retrain.py, and run real git/dvc commands against
+      # this checkout (see AIRFLOW__CORE__DAGS_FOLDER in .env for the
+      # matching DAGs-folder override).
+      - .:/opt/airflow/project
     depends_on:
       postgres:
         condition: service_healthy

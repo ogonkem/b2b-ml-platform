@@ -22,8 +22,9 @@ An automated MLOps loop keeps the model current: tenants upload labeled outcomes
 7. [Async batch pipeline](#7-async-batch-pipeline)
 8. [MLOps automation](#8-mlops-automation)
 9. [Observability](#9-observability)
-10. [Running locally](#running-locally)
-11. [Repository layout](#repository-layout)
+10. [Holdout lifecycle testing](#10-holdout-lifecycle-testing)
+11. [Running locally](#running-locally)
+12. [Repository layout](#repository-layout)
 
 ---
 
@@ -171,6 +172,8 @@ MLflow handles two jobs:
 
 Model artefacts live in MLflow; training *data* is versioned with DVC. DVC commits tiny pointer files (`.dvc`) to git while the actual CSVs sit in MinIO. This means git history records exactly which data produced each model without storing large files in the repository.
 
+The MinIO remote's endpoint isn't hardcoded in `.dvc/config` — `dvc`/`boto3` read it from the `AWS_ENDPOINT_URL` environment variable, same pattern as `MLFLOW_S3_ENDPOINT_URL`. Every container gets `AWS_ENDPOINT_URL=http://minio:9000` from `.env`. Running `dvc` directly from the host instead (outside any container) needs `AWS_ENDPOINT_URL=http://localhost:9000` set in that shell first.
+
 > **Closed-source alternative:** Weights & Biases (W&B) and Neptune.ai are commercial alternatives to MLflow with richer visualisation and team collaboration features. SageMaker Model Registry manages versioning and deployment together. MLflow is the only fully open-source option with a built-in UI, REST API, and Python SDK. For data versioning, Pachyderm and Delta Lake offer stronger lineage guarantees than DVC at the cost of more infrastructure.
 
 ---
@@ -275,6 +278,12 @@ sync_data → train_model → promote_model
 
 > **Closed-source alternative:** Prefect and Dagster offer more modern Python-native DAG APIs with better type safety and native async. AWS Step Functions, GCP Workflows, and Azure Data Factory replace Airflow with fully managed schedulers. MLflow Projects can run training scripts without a separate orchestrator if the workflow is simple enough.
 
+### The Airflow image
+
+`airflow` runs a custom image (`Dockerfile.airflow`), not the stock `apache/airflow` one — the stock image only has Airflow itself, but both DAGs need `git`/`dvc` on `PATH` and the same ML stack `notebooks/retrain.py` trains with (`shared/drift.py`'s PSI check alone needs `pandas`). The full repo is bind-mounted into the container (not just `airflow_dags/`) so the DAG tasks' `subprocess` calls — `git commit`, `dvc push`, `python notebooks/retrain.py` — run against the real checkout, with `AIRFLOW__CORE__DAGS_FOLDER` pointed at the mounted path. Automated commits from `commit_to_dvc` are authored as `selastone-mlops-bot`, kept distinct from human commits in git history.
+
+The DVC remote's endpoint isn't hardcoded in `.dvc/config` for the same dev/prod-parity reason described in [DVC](#dvc) above — every container reads `AWS_ENDPOINT_URL` from its own environment.
+
 ---
 
 ## 9. Observability
@@ -283,16 +292,34 @@ sync_data → train_model → promote_model
 
 The API exposes a `/metrics` endpoint that Prometheus scrapes every 15 seconds. Metrics tracked:
 
-| Metric | Labels | What it measures |
-|---|---|---|
-| `predictions_total` | `tenant_id`, `prediction` | Count of 0/1 decisions per tenant |
-| `prediction_latency_seconds` | — | End-to-end request latency histogram |
-| `batch_uploads_total` | `tenant_id`, `status` | Upload outcomes (success / invalid / quota_exceeded / minio_error) |
-| `batch_rows_total` | `tenant_id` | Total rows processed per tenant per month |
+| Metric                       | Labels                    | What it measures                                                   |
+|------------------------------|---------------------------|--------------------------------------------------------------------|
+| `predictions_total`          | `tenant_id`, `prediction` | Count of 0/1 decisions per tenant                                  |
+| `prediction_latency_seconds` | —                         | End-to-end request latency histogram                               |
+| `batch_uploads_total`        | `tenant_id`, `status`     | Upload outcomes (success / invalid / quota_exceeded / minio_error) |
+| `batch_rows_total`           | `tenant_id`               | Total rows processed per tenant per month                          |
 
 Grafana dashboards show these alongside PSI drift scores queried from ClickHouse. A rising PSI trend on the dashboard is an early warning before the formal 0.2 threshold triggers retraining — it gives operators time to investigate whether drift reflects a genuine distribution shift or a data quality issue upstream.
 
 > **Closed-source alternative:** Datadog, New Relic, and Dynatrace provide full-stack observability with managed infrastructure and alerting. For ML-specific monitoring, Arize AI and Fiddler monitor prediction distributions and model performance degradation with less setup than building custom dashboards.
+
+---
+
+## 10. Holdout lifecycle testing
+
+`notebooks/make_holdout_splits.py` carves the 148,670-row baseline into non-overlapping slices — one per stage of the product story — written to `notebooks/archive/holdout/` (gitignored, regenerable):
+
+| Slice | Rows | Used by |
+|---|---|---|
+| `train_slice.csv` | 100,000 | Training a holdout-clean baseline champion |
+| `single_predict_holdout.csv` | 25 | `POST /v1/predict`, one row at a time |
+| `bulk_predict_holdout.csv` + answer key | 2,000 | `POST /v1/batch/upload` |
+| `labeled_data_drift.csv` | 1,500 | `POST /v1/labeled-data` — engineered low-Credit_Score rows, deliberately over the PSI 0.2 threshold |
+| `labeled_data_stable.csv` | 1,500 | `POST /v1/labeled-data` — plain random sample, negative control |
+
+`lifecycle_tests/` (separate from `tests/`) drives the real, running stack through all five stages using these slices — not mocked: real MLflow promotions, a real restart of `celery_worker` to pick up a freshly trained model, and real Airflow DAG triggers (including the daily DAG's real `git`/`dvc` commit when drift is detected). Each numbered script is independently runnable and checks its own prerequisites; `run_all.sh` chains all seven in order. See `lifecycle_tests/README.md` for the full stage breakdown and known constraints (the 1,000-row/month tenant quota caps how much of `bulk_predict_holdout.csv` a single request can use, for one).
+
+This exercise is what surfaced several bugs invisible to mocked unit tests: `ModelManager` never actually serving a promoted model to `/v1/predict` ([Prediction API](#6-prediction-api)), a raw-vs-hyphenated feature name mismatch that silently dropped `co-applicant_credit_type` on every real-time prediction, a quota check that charged tenants for requests it then rejected, and `promote_if_better()` passing arguments in the wrong order to `create_model_version` — which would have crashed the very first time a challenger actually earned promotion.
 
 ---
 
@@ -325,14 +352,14 @@ python -m pytest tests/integration/ -v
 
 **Service endpoints:**
 
-| Service | URL |
-|---|---|
+| Service                       | URL |
+|-------------------------------|---|
 | Prediction API + Swagger docs | http://localhost:8000/docs |
-| MLflow experiment tracker | http://localhost:5000 |
-| MinIO console | http://localhost:9001 |
-| Airflow scheduler | http://localhost:8080 |
-| Grafana dashboards | http://localhost:3000 |
-| Prometheus metrics | http://localhost:9090 |
+| MLflow experiment tracker     | http://localhost:5000      |
+| MinIO console                 | http://localhost:9001      |
+| Airflow scheduler             | http://localhost:8080      |
+| Grafana dashboards            | http://localhost:3000 |
+| Prometheus metrics            | http://localhost:9090 |
 
 ---
 
@@ -354,11 +381,15 @@ python -m pytest tests/integration/ -v
 │   └── promotion.py         # promote_if_better(): 2% AUC gate before Production swap
 ├── notebooks/
 │   ├── retrain.py           # Headless training: 4 models → MLflow logging → artefact save
+│   ├── make_holdout_splits.py # Carves non-overlapping per-stage holdout slices (see §10)
+│   ├── archive/holdout/     # Generated slices — gitignored, regenerable
 │   └── models/              # Artefacts: best_model.pkl, scaler.pkl, feature_names.json …
+├── lifecycle_tests/         # Real end-to-end stage-by-stage tests against the holdout slices
 ├── tests/
 │   ├── unit/                # Isolated unit tests — all external calls mocked
 │   └── integration/         # Live stack tests: API endpoints, batch pipeline, MLops loop
 ├── docker-compose.yml       # 10-service stack on a shared bridge network
 ├── Dockerfile.api           # Python 3.12-slim — shared image for API and Celery worker
+├── Dockerfile.airflow       # apache/airflow + git/dvc + the ML stack the DAGs need (see §8)
 └── requirements.txt         # Runtime deps: fastapi, celery, xgboost, lightgbm, mlflow …
 ```

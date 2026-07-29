@@ -217,15 +217,20 @@ def check_and_increment_quota(tenant_id: str, increment: int = 1, monthly_limit:
     Raises 429 if the running total exceeds monthly_limit.
     """
     key = f"quota:{tenant_id}:{datetime.utcnow().strftime('%Y_%m')}"
-    current = redis_client.incrby(key, increment)
-    if current <= increment:
-        # Key was just created (or reset); set ~1-month TTL for automatic reset
-        redis_client.expire(key, 60 * 60 * 24 * 32)
-    if current > monthly_limit:
+    # Check before incrementing — incrementing first (then rejecting on
+    # overage) permanently charges the tenant for requests that never went
+    # through, so a single oversized batch upload could burn through the
+    # rest of the month's quota even though it was rejected outright.
+    existing = int(redis_client.get(key) or 0)
+    if existing + increment > monthly_limit:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Monthly prediction quota exceeded"
         )
+    current = redis_client.incrby(key, increment)
+    if current <= increment:
+        # Key was just created (or reset); set ~1-month TTL for automatic reset
+        redis_client.expire(key, 60 * 60 * 24 * 32)
     return current
 
 # -------------------------------------------------------------------------
@@ -331,11 +336,30 @@ async def predict_default(
 
     start = time.time() # start timer
     try:
-        transformed_features = feature_pipeline.transform(pd.DataFrame([payload.model_dump()]))
+        # The training data's raw column is `co-applicant_credit_type` (hyphen,
+        # straight from the source CSV) — Python identifiers can't contain
+        # hyphens, so the pydantic field is named with an underscore instead.
+        # Without this rename, FeaturePipeline never finds the column under its
+        # trained name and silently falls back to the training-mode value on
+        # every request, ignoring whatever the caller actually sent.
+        payload_dict = payload.model_dump()
+        payload_dict["co-applicant_credit_type"] = payload_dict.pop("co_applicant_credit_type")
+        transformed_features = feature_pipeline.transform(pd.DataFrame([payload_dict]))
 
-        # Calculate raw probability score and concrete decisions
-        probability = float(pred_model.predict_proba(transformed_features)[0, 1])
-        prediction = int(pred_model.predict(transformed_features)[0])
+        # Prefer the hot-swapped Production model once ModelManager has loaded
+        # one; fall back to the model loaded at startup (dev mode, or before any
+        # model has ever been promoted to Production). Without this branch,
+        # /v1/predict silently keeps using the startup model forever even after
+        # promotion — ModelManager's poll loop would update model_manager.version
+        # (visible on /health) but never actually reach a live request.
+        if model_manager is not None and model_manager.is_loaded:
+            probability   = float(model_manager.predict_proba(transformed_features)[0, 1])
+            prediction    = int(model_manager.predict(transformed_features)[0])
+            model_version = str(model_manager.version)
+        else:
+            probability   = float(pred_model.predict_proba(transformed_features)[0, 1])
+            prediction    = int(pred_model.predict(transformed_features)[0])
+            model_version = "dev"
 
         # RECORD LATENCY and INCREMENT COUNTER
         PREDICTION_LATENCY.observe(time.time() - start) 
@@ -347,10 +371,11 @@ async def predict_default(
         # Log the prediction event in ClickHouse for future analysis
         try:
             log_prediction(
-                tenant_id=tenant, 
-                app_id=payload.ID, 
-                prob=probability, 
-                pred=prediction
+                tenant_id=tenant,
+                app_id=payload.ID,
+                prob=probability,
+                pred=prediction,
+                model_version=model_version,
             )
         except Exception as log_err:
             print(f"[WARNING] Logging failed: {log_err}")

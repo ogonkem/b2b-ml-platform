@@ -22,7 +22,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 
 from airflow import DAG
-from airflow.providers.standard.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 

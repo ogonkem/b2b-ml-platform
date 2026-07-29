@@ -1,5 +1,5 @@
 from airflow import DAG
-from airflow.providers.standard.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
 import subprocess
 import sys
@@ -35,8 +35,11 @@ with DAG(
         not fetch new .dvc pointers or download new data from remote.
         dvc pull = dvc fetch + dvc checkout, and works on the latest git HEAD.
         """
-        subprocess.run(["git", "pull", "--ff-only"], check=True)
-        subprocess.run(["dvc", "pull"],               check=True)
+        # Explicit remote/branch — a bare `git pull` depends on the checkout
+        # having upstream tracking configured for the current branch, which
+        # isn't guaranteed on every machine that runs this DAG.
+        subprocess.run(["git", "pull", "--ff-only", "origin", "main"], check=True)
+        subprocess.run(["dvc", "pull"],                                check=True)
 
     def run_training():
         """

@@ -35,7 +35,6 @@ warnings.filterwarnings('ignore')
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score, f1_score, roc_auc_score, confusion_matrix
@@ -49,6 +48,8 @@ import mlflow
 import mlflow.xgboost
 import mlflow.sklearn
 import mlflow.lightgbm
+
+from shared.features import FeaturePipeline
 
 np.random.seed(42)
 
@@ -184,43 +185,46 @@ print(f"  Remaining numeric features: {len(numeric_cols)}")
 
 # ════════════════════════════════════════════════════════════════════════════
 # 5. PREPARE FEATURES  (mirrors Cell 12)
+#    Categoricals are left as raw strings and numeric columns unclipped here —
+#    encoding and outlier clipping are now learned by FeaturePipeline itself
+#    (step 7, below) from the train split only, so the exact same logic runs
+#    at inference time via feature_pipeline.pkl. No separate preprocessing
+#    path to drift out of sync with serving.
 # ════════════════════════════════════════════════════════════════════════════
 print(f"\n── Prepare features ──")
 
 X = df[numeric_cols + categorical_cols].copy()
 y = df['Status'].copy()
-
-label_encoders = {}
-for col in categorical_cols:
-    le = LabelEncoder()
-    X[col] = le.fit_transform(X[col].astype(str))
-    label_encoders[col] = le
-
-for col in numeric_cols:
-    q1, q99  = X[col].quantile(0.01), X[col].quantile(0.99)
-    X[col]   = X[col].clip(q1, q99)
-
-feature_names = X.columns.tolist()
-print(f"  ✓ {len(feature_names)} features ready")
+print(f"  ✓ {X.shape[1]} raw features assembled")
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # 6. TRAIN-TEST SPLIT  (mirrors Cell 14)
 # ════════════════════════════════════════════════════════════════════════════
-X_train, X_test, y_train, y_test = train_test_split(
+X_train_raw, X_test_raw, y_train, y_test = train_test_split(
     X, y, test_size=0.2, random_state=42, stratify=y
 )
 print(f"\n── Train/test split ──")
-print(f"  Train: {X_train.shape}  |  Test: {X_test.shape}")
+print(f"  Train: {X_train_raw.shape}  |  Test: {X_test_raw.shape}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 7. SCALE FEATURES  (mirrors Cell 16)
+# 7. FIT FEATURE PIPELINE — encode + clip + scale  (mirrors Cell 16 + Cell 62,
+#    now merged into one step)
+#    FeaturePipeline.fit() learns imputation medians/modes, label-encoding
+#    maps, and outlier clip bounds from X_train_raw only (no leakage from the
+#    test split), then fits its scaler on top of that. transform() reproduces
+#    exactly what /v1/predict and the Celery batch worker do at inference time.
 # ════════════════════════════════════════════════════════════════════════════
-scaler         = StandardScaler()
-X_train_scaled = scaler.fit_transform(X_train)
-X_test_scaled  = scaler.transform(X_test)
-print(f"\n── Scale ──")
+prod_pipeline = FeaturePipeline()
+prod_pipeline.fit(X_train_raw, target_col='Status')
+
+feature_names  = prod_pipeline.feature_names
+scaler         = prod_pipeline.scaler
+X_train_scaled = prod_pipeline.transform(X_train_raw)
+X_test_scaled  = prod_pipeline.transform(X_test_raw)
+print(f"\n── Fit FeaturePipeline (encode + clip + scale) ──")
+print(f"  ✓ {len(feature_names)} features ready")
 print(f"  ✓ StandardScaler fitted on train set")
 
 
@@ -236,11 +240,15 @@ print(f"  After : {X_train_balanced.shape[0]:,} rows  ({y_train_balanced.mean():
 
 # ════════════════════════════════════════════════════════════════════════════
 # 9. TRAIN ALL 4 MODELS using tuned hyperparameters
-#    Input matrix per model matches notebook exactly:
+#    Input matrix per model:
 #      XGBoost          → X_train_balanced (scaled + SMOTE)
 #      LightGBM         → X_train_balanced (scaled + SMOTE)
 #      LogisticReg      → X_train_scaled   (scaled, no SMOTE — class_weight='balanced')
-#      Random Forest    → X_train          (raw, no SMOTE  — class_weight='balanced')
+#      Random Forest    → X_train_scaled   (scaled, no SMOTE  — class_weight='balanced')
+#    Random Forest now takes the scaled matrix too (previously unscaled): a
+#    StandardScaler is a monotonic per-feature transform, so it cannot change
+#    which threshold a tree splits on relative to other rows — predictions are
+#    unaffected, and this lets every model share the one FeaturePipeline output.
 # ════════════════════════════════════════════════════════════════════════════
 scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
 print(f"\n── Train models (scale_pos_weight={scale_pos_weight:.2f}) ──")
@@ -287,7 +295,7 @@ rf_model = RandomForestClassifier(
     n_jobs=-1,
     verbose=0
 )
-rf_model.fit(X_train, y_train)
+rf_model.fit(X_train_scaled, y_train)
 print(f"  ✓ Random Forest  ({rf_model.n_estimators} trees)")
 
 
@@ -319,7 +327,7 @@ results = [
     compute_metrics(xgb_model, X_test_scaled, y_test, "XGBoost"),
     compute_metrics(lgb_model, X_test_scaled, y_test, "LightGBM"),
     compute_metrics(lr_model,  X_test_scaled, y_test, "LogisticRegression"),
-    compute_metrics(rf_model,  X_test,        y_test, "RandomForest"),
+    compute_metrics(rf_model,  X_test_scaled, y_test, "RandomForest"),
 ]
 
 header = f"{'Model':<22} {'AUC':>7} {'F1':>7} {'Acc':>7} {'Prec':>7} {'Rec':>7}"
@@ -387,8 +395,8 @@ metadata = {
     'test_accuracy':           best['accuracy'],
     'test_precision':          best['precision'],
     'test_recall':             best['recall'],
-    'train_samples':           int(len(X_train)),
-    'test_samples':            int(len(X_test)),
+    'train_samples':           int(len(X_train_raw)),
+    'test_samples':            int(len(X_test_raw)),
     'num_features':            len(feature_names),
     'default_rate':            float(y.mean()),
     'leaky_features_removed':  LEAKY_FEATURES,
@@ -412,15 +420,9 @@ print(f"  ✓ shap_background.pkl  ({shap_background.shape[0]} rows)")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 12. FIT & SAVE FEATURE PIPELINE  (mirrors Cell 62)
+# 12. SAVE FEATURE PIPELINE  (mirrors Cell 62)
+#     Already fit on X_train_raw in step 7 — saved here now that OUTPUT_DIR exists.
 # ════════════════════════════════════════════════════════════════════════════
-print(f"\n── Fit FeaturePipeline ──")
-from shared.features import FeaturePipeline
-
-X_train_raw   = X_train.copy()   # unscaled — pipeline fits its own scaler
-prod_pipeline = FeaturePipeline()
-prod_pipeline.fit(X_train_raw, target_col='Status')
-
 with open(OUTPUT_DIR / 'feature_pipeline.pkl', 'wb') as f:
     pickle.dump(prod_pipeline, f)
 print(f"  ✓ feature_pipeline.pkl")
@@ -482,7 +484,7 @@ model_params_log = {
         "class_weight":     "balanced",
         "smote":            False,
         "leaky_removed":    True,
-        "input":            "X_train_raw",
+        "input":            "X_train_scaled",
     },
 }
 

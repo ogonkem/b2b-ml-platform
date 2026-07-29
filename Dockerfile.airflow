@@ -1,0 +1,50 @@
+# Extends the stock Airflow image so selastone_daily_ingestion and
+# selastone_weekly_retrain can actually run: they need `git`/`dvc` on PATH
+# and the same ML stack notebooks/retrain.py trains with. Versions mirror
+# requirements.txt where the same package is pinned there, so a retrain run
+# behaves identically whether it's launched from this image or the API one.
+FROM apache/airflow:2.7.0-python3.11
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        libgomp1 && \
+    rm -rf /var/lib/apt/lists/*
+# libgomp1 — lightgbm's compiled core (basic.py's ctypes.cdll.LoadLibrary)
+# needs libgomp.so.1 (GNU OpenMP) at import time; not present on this base
+# image, so a plain `import lightgbm` fails without it.
+
+USER airflow
+# Bind-mounting the host repo means files are owned by the host user, not
+# the container's `airflow` user — git refuses to touch it without this.
+RUN git config --global --add safe.directory /opt/airflow/project
+
+# A few packages need an explicit version floor because pip's resolver,
+# left to its own devices, prefers older versions already pinned by some
+# other already-installed package — none of which actually need the old
+# version at runtime, they just happen to allow it:
+#  - pyarrow:  resolves down to v11 (pre-numpy-2.0) otherwise. pandas alone
+#    tolerates it, but sklearn's unconditional `import pyarrow` (used by
+#    notebooks/retrain.py) doesn't, and fails on `_ARRAY_API not found`.
+#  - dask: lightgbm's import chain unconditionally pulls in dask for its
+#    optional distributed-training integration; the resolver's default
+#    (2023.8.0) predates numpy 2.0 and crashes on import (np.unicode_ was
+#    removed) instead of being skipped as optional.
+#  - email-validator: capped at v1.3.1 by an unrelated Flask-AppBuilder
+#    web-UI extra; pydantic v2 (pulled in by mlflow) requires >=2.0.
+RUN pip install --no-cache-dir \
+        numpy==2.4.6 \
+        pandas==2.3.3 \
+        "pyarrow>=17" \
+        scikit-learn==1.8.0 \
+        xgboost==3.2.0 \
+        lightgbm==4.6.0 \
+        "dask[dataframe]>=2024.1" \
+        imbalanced-learn \
+        mlflow==3.13.0 \
+        boto3==1.43.41 \
+        botocore==1.43.41 \
+        minio==7.2.15 \
+        dvc==3.67.1 \
+        dvc-s3 \
+        "email-validator>=2.0"
