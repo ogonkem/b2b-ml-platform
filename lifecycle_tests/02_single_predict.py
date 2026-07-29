@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (
     BASE_URL, HEADERS, HOLDOUT_DIR,
     require, require_holdout_files, require_api_reachable, require_state,
-    health, score, print_score, banner,
+    wait_for_model_version, score, print_score, banner,
 )
 
 HOLDOUT_FILE = "single_predict_holdout.csv"
@@ -28,6 +28,18 @@ def main():
     require_holdout_files(HOLDOUT_FILE)
     require_api_reachable()
     state = require_state("baseline_version")
+
+    # ModelManager polls MLflow for the Production version on an interval
+    # (MODEL_POLL_INTERVAL, default 60s) — wait for it to actually pick up
+    # what stage 1 just promoted before sending any predictions, otherwise
+    # they'd be served by whatever was Production beforehand.
+    baseline_version = str(state["baseline_version"])
+    served = wait_for_model_version(baseline_version, timeout_s=90)
+    require(
+        served == baseline_version,
+        f"/health still reports model_version={served} after 90s, expected {baseline_version}",
+    )
+    print(f"  /health model_version = {served}  (matches baseline)")
 
     df = pd.read_csv(HOLDOUT_DIR / HOLDOUT_FILE)
 
@@ -59,15 +71,6 @@ def main():
 
     result = score(y_true, y_prob)
     print_score("single_predict_holdout", result)
-
-    h = health()
-    served_version = str(h.get("model_version"))
-    baseline_version = str(state["baseline_version"])
-    require(
-        served_version == baseline_version,
-        f"/health reports model_version={served_version}, expected baseline {baseline_version}",
-    )
-    print(f"\n  /health model_version = {served_version}  (matches baseline)")
     print("\n[OK] Stage 2 complete.")
 
 
