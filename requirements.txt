@@ -45,6 +45,12 @@ requests==2.34.2
 # ── Observability ─────────────────────────────────────────────────────────────
 prometheus-client==0.25.0   # Policy-aligned — quota + latency metrics for Grafana
 
+# ── Auth (user accounts, JWT sessions, API keys) ─────────────────────────────
+psycopg2-binary==2.9.10     # Postgres driver — app.users / app.tenants / app.api_keys
+PyJWT==2.13.0
+bcrypt==4.2.1               # password hashing — used directly, not via passlib
+email-validator==2.3.0      # pydantic EmailStr
+
 # ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv==1.2.2
 typing_extensions==4.15.0

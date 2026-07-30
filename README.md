@@ -23,8 +23,9 @@ An automated MLOps loop keeps the model current: tenants upload labeled outcomes
 8. [MLOps automation](#8-mlops-automation)
 9. [Observability](#9-observability)
 10. [Holdout lifecycle testing](#10-holdout-lifecycle-testing)
-11. [Running locally](#running-locally)
-12. [Repository layout](#repository-layout)
+11. [Frontend and multi-user accounts](#11-frontend-and-multi-user-accounts)
+12. [Running locally](#running-locally)
+13. [Repository layout](#repository-layout)
 
 ---
 
@@ -186,9 +187,13 @@ The API is the system's front door. It handles authentication, quota enforcement
 
 ### Authentication
 
-Every request must include `Authorization: Bearer <token>`. Valid tokens are loaded from the `API_TOKENS` environment variable (comma-separated). Lookup is O(1) against a Python `set` regardless of tenant count. The token doubles as the tenant identifier — it appears in MinIO object paths, Redis quota keys, and ClickHouse logs, so a single credential ties all activity together without a separate session layer.
+Every request must include `Authorization: Bearer <token>`. `verify_token()` accepts three kinds of bearer value, all resolving to the same `tenant_id` concept used throughout the platform (MinIO object paths, Redis quota keys, ClickHouse logs):
 
-> **Closed-source alternative:** OAuth2 with JWTs allows token expiry, fine-grained scopes, and refresh without redeployment. AWS API Gateway and GCP Cloud Endpoints handle authentication before traffic reaches the application server.
+1. **A static, pre-shared `API_TOKENS` entry** (comma-separated env var, O(1) lookup against a Python `set`) — the token itself is the tenant ID. This is the original mechanism and still works unchanged, for CI and any integration wired up before user accounts existed.
+2. **A JWT** issued by `/auth/login` or `/auth/register` — see [§11](#11-frontend-and-multi-user-accounts).
+3. **A persistent, DB-issued API key** (`sk_…`, from `/auth/api-key`) — for scripts and integrations that shouldn't hold a browser-session JWT.
+
+> **Closed-source alternative:** AWS API Gateway and GCP Cloud Endpoints handle authentication before traffic reaches the application server, at the cost of vendor lock-in for the auth layer itself.
 
 ### Real-time scoring — `POST /v1/predict`
 
@@ -323,6 +328,50 @@ This exercise is what surfaced several bugs invisible to mocked unit tests: `Mod
 
 ---
 
+## 11. Frontend and multi-user accounts
+
+**`frontend/` — React + Vite + TypeScript (port 3001)**
+
+Alongside the static-token integrations, the platform has a browser UI with real user accounts: registration, login, and a page per endpoint (predict, batch, labeled data, usage, account, admin). A logged-in user *is* a tenant — the existing quota/logging/MinIO code in [§6](#6-prediction-api) and [§7](#7-async-batch-pipeline) didn't change at all, it just started receiving `tenant_id`s that come from a JWT instead of a static token.
+
+### Data model — Postgres `app` schema
+
+A dedicated schema (`app.tenants`, `app.users`, `app.api_keys`), separate from Airflow's own metadata tables in the same Postgres instance ([§1](#1-data-storage-layer)). Created via idempotent `CREATE TABLE IF NOT EXISTS` DDL at API startup (`app/db.py`) — no ORM or migration tool, matching the project's existing thin-client style (`redis-py`, `minio`, `clickhouse-connect` are all used directly elsewhere too).
+
+A tenant is an organization, not a single login — multiple users can share one, sharing its quota bucket, prediction history, and batch jobs. **Multi-user resolution is via invite code, not SSO:** registering supplies either a `tenant_name` (creates a new org, returns its invite code once) or an `invite_code` (joins an existing org). Real SSO (per-tenant SAML/OIDC) is a known future item, deliberately out of scope here.
+
+`role` on `app.users` is a global app-operator flag (`user` / `admin`), unrelated to which tenant a user belongs to — it gates the cross-tenant `/admin/tenants` endpoint, not anything tenant-scoped. The first user ever registered is auto-promoted to `admin` so there's always at least one.
+
+### Auth endpoints — `app/auth.py`
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /auth/register` | Create a user + tenant (or join one via invite code); returns a JWT |
+| `POST /auth/login` | Verify bcrypt password hash; returns a JWT (24h expiry by default) |
+| `GET /auth/me` | Current user's email/tenant_id/role from the JWT |
+| `POST /auth/api-key` | Generate/regenerate a persistent `sk_…` key; deletes any previous key first, so regenerating truly invalidates the old one |
+
+Passwords are hashed with `bcrypt` directly (not `passlib`, which has known compatibility friction with modern `bcrypt` releases).
+
+### Dashboard endpoints
+
+Four read endpoints back the UI, all resolving `tenant_id` through the same unified `verify_token()`:
+
+| Endpoint | Backs |
+|---|---|
+| `GET /v1/usage` | Usage page — reads the same `quota:{tenant}:{month}` Redis key `check_and_increment_quota` writes |
+| `GET /v1/batch/jobs` | Batch page's job history — a Redis list (`jobs:{tenant}`) pushed to alongside the existing per-job status keys |
+| `GET /v1/predictions/history` | Usage page's recent-predictions table — queried from the ClickHouse `prediction_logs` table |
+| `GET /admin/tenants` | Admin page — every tenant's quota usage and user count (`admin` role only) |
+
+### Frontend
+
+React + Vite + TypeScript, `react-router-dom` for routing, an `AuthContext` holding the JWT (persisted to `localStorage`) and current user, and a thin `fetch` wrapper that attaches `Authorization: Bearer <jwt>` and redirects to `/login` on a 401. `RequireAuth`/`RequireAdmin` route guards enforce the same access rules client-side that the backend already enforces server-side.
+
+Served in production via `Dockerfile.frontend` — a multi-stage build (Node build, then static files served by nginx, with an SPA fallback so deep links like `/dashboard` don't 404 on refresh). CORS is opened for the frontend's origin via `CORSMiddleware` (`FRONTEND_ORIGINS` env var).
+
+---
+
 ## Running locally
 
 **Requirements:** Docker Desktop (8 GB RAM allocated), Python 3.12
@@ -354,6 +403,7 @@ python -m pytest tests/integration/ -v
 
 | Service                       | URL |
 |-------------------------------|---|
+| Frontend (login/dashboard/admin) | http://localhost:3001 |
 | Prediction API + Swagger docs | http://localhost:8000/docs |
 | MLflow experiment tracker     | http://localhost:5000      |
 | MinIO console                 | http://localhost:9001      |
@@ -367,8 +417,11 @@ python -m pytest tests/integration/ -v
 
 ```
 ├── app/
-│   ├── main.py              # FastAPI: /v1/predict, /v1/batch/upload, /v1/labeled-data
+│   ├── main.py              # FastAPI: /v1/predict, /v1/batch/upload, /v1/labeled-data, dashboard endpoints
+│   ├── auth.py              # /auth/register, /auth/login, /auth/me, /auth/api-key (see §11)
+│   ├── db.py                # Postgres app schema: tenants / users / api_keys, idempotent DDL
 │   └── model_manager.py     # Polling hot-swap daemon — threading.Lock + MLflow registry
+├── frontend/                # React + Vite + TS SPA — login/dashboard/predict/batch/usage/admin (see §11)
 ├── shared/
 │   ├── features.py          # FeaturePipeline: fit/transform, imputation, derived features
 │   └── drift.py             # PSI: compute_psi(), check_drift()
@@ -388,8 +441,9 @@ python -m pytest tests/integration/ -v
 ├── tests/
 │   ├── unit/                # Isolated unit tests — all external calls mocked
 │   └── integration/         # Live stack tests: API endpoints, batch pipeline, MLops loop
-├── docker-compose.yml       # 10-service stack on a shared bridge network
+├── docker-compose.yml       # 11-service stack on a shared bridge network
 ├── Dockerfile.api           # Python 3.12-slim — shared image for API and Celery worker
 ├── Dockerfile.airflow       # apache/airflow + git/dvc + the ML stack the DAGs need (see §8)
-└── requirements.txt         # Runtime deps: fastapi, celery, xgboost, lightgbm, mlflow …
+├── Dockerfile.frontend      # Multi-stage: node build → nginx serve (see §11)
+└── requirements.txt         # Runtime deps: fastapi, celery, xgboost, lightgbm, mlflow, psycopg2, PyJWT, bcrypt …
 ```

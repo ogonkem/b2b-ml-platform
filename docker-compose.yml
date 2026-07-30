@@ -181,6 +181,8 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_started   # ← API can start before ClickHouse is fully healthy
+      postgres:
+        condition: service_healthy   # ← app.users/app.tenants schema init needs Postgres up
     networks:
       - backend-network
     healthcheck:
@@ -210,6 +212,23 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    networks:
+      - backend-network
+
+  # ── Frontend (React + Vite, served via nginx) ─────────────────────────────
+  # JWT login/register + dashboard/predict/batch/labeled-data/usage/admin UI
+  # UI → http://localhost:3001
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        VITE_API_BASE_URL: http://localhost:8000
+    container_name: selastone-frontend
+    ports:
+      - "3001:80"
+    depends_on:
+      - api
     networks:
       - backend-network
 

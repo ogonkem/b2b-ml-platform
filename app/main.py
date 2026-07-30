@@ -4,7 +4,8 @@ from typing import Dict, Any, Optional
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from fastapi import FastAPI, HTTPException, Security, status, UploadFile, File
+from fastapi import Depends, FastAPI, HTTPException, Security, status, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 import pickle, os
@@ -33,11 +34,37 @@ if str(root_path) not in sys.path:
 from shared.features import FeaturePipeline
 
 app = FastAPI(
-    title="Loan Pipeline Gateway", 
+    title="Loan Pipeline Gateway",
     version="1.3.0",
     description="Production API endpoint for processing dynamic loan configurations and calculating risk defaults."
 )
 security_scheme = HTTPBearer(auto_error=False)
+
+# No browser client existed before the frontend/ SPA — CORS was never
+# needed until now. FRONTEND_ORIGINS is a comma-separated list so both the
+# Vite dev server and the built/nginx-served bundle can be allowed at once.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.environ.get("FRONTEND_ORIGINS", "http://localhost:5173").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Every endpoint here returns data scoped to whichever bearer token made the
+# request, on URLs that don't otherwise vary per tenant (e.g. GET
+# /v1/usage). Without this, a browser (or any intermediary cache) is free to
+# serve one tenant's cached response to a different tenant hitting the same
+# path — the HTTP cache model keys on URL, not on Authorization header
+# contents, unless told not to cache at all.
+@app.middleware("http")
+async def no_store_cache(request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+from app.auth import router as auth_router, require_admin
+app.include_router(auth_router)
 
 # -------------------------------------------------------------------------
 # prometheus metrics
@@ -75,7 +102,39 @@ app.mount("/metrics", metrics_app)
 
 VALID_TOKENS = set(os.environ.get("API_TOKENS", "dev-token").split(","))
 
+def _lookup_api_key_tenant(raw_key: str) -> Optional[str]:
+    """Resolve a persistent, DB-issued API key (POST /auth/api-key) to its
+    owner's tenant_id. Any failure (Postgres unreachable, etc.) is treated as
+    'not a valid key' rather than a hard error — this is one of several
+    things a bearer value could be, not the only one."""
+    from app.auth import _hash_key
+    from app.db import get_cursor
+    try:
+        with get_cursor() as cur:
+            cur.execute(
+                """SELECT u.tenant_id FROM app.api_keys k
+                   JOIN app.users u ON u.id = k.user_id
+                   WHERE k.key_hash = %s""",
+                (_hash_key(raw_key),),
+            )
+            row = cur.fetchone()
+        return row["tenant_id"] if row else None
+    except Exception:
+        return None
+
+
 def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Security(security_scheme)):
+    """Accepts three kinds of bearer value, in order, all resolving to a
+    tenant_id exactly as before — /v1/predict etc. don't need to know which
+    kind was used:
+      1. A static, pre-shared API_TOKENS entry (unchanged) — tenant_id is
+         the token itself.
+      2. A JWT issued by /auth/login or /auth/register (app/auth.py) —
+         tenant_id comes from the JWT's own claim.
+      3. A persistent, DB-issued API key (POST /auth/api-key) — only
+         attempted for values shaped like one (see app.auth._generate_api_key)
+         so a plain invalid token never triggers a Postgres round-trip.
+    """
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -83,13 +142,24 @@ def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Security(
             headers={"WWW-Authenticate": "Bearer"}
         )
     token = credentials.credentials
-    if token not in VALID_TOKENS:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid or missing API token."
-        )
-    
-    return token
+
+    if token in VALID_TOKENS:
+        return token
+
+    from app.auth import decode_jwt
+    payload = decode_jwt(token)
+    if payload is not None:
+        return payload["tenant_id"]
+
+    if token.startswith("sk_"):
+        tenant_id = _lookup_api_key_tenant(token)
+        if tenant_id is not None:
+            return tenant_id
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Invalid or missing API token."
+    )
 
 
 # -------------------------------------------------------------------------
@@ -200,6 +270,15 @@ except Exception as e:
     print(f"⚠️  ModelManager failed to start: {e}")
     model_manager = None
 
+# ── Auth schema — idempotent, safe to run on every startup ────────────────
+from app.db import init_schema
+
+try:
+    init_schema()
+    print("✓ Auth schema ready (app.tenants / app.users / app.api_keys)")
+except Exception as e:
+    print(f"⚠️  Auth schema init failed: {e}")
+
 # -------------------------------------------------------------------------
 # Redis client initialization (for future stateful features like caching or rate limiting)
 # -------------------------------------------------------------------------
@@ -209,7 +288,9 @@ redis_client = redis.Redis(
     decode_responses=True
 )
 
-def check_and_increment_quota(tenant_id: str, increment: int = 1, monthly_limit: int = 1000):
+MONTHLY_QUOTA_LIMIT = 1000  # shared with GET /v1/usage and GET /admin/tenants below
+
+def check_and_increment_quota(tenant_id: str, increment: int = 1, monthly_limit: int = MONTHLY_QUOTA_LIMIT):
     """
     Increments this tenant's monthly row counter by `increment`.
     For /v1/predict pass increment=1 (default).
@@ -317,6 +398,28 @@ minio_client = Minio(
     secure=False
 )
 
+# A presigned URL's host is baked into its SigV4 signature — MINIO_HOST is the
+# Docker network hostname ("minio"), which only resolves inside the compose
+# network, not in a browser. Rewriting the host in a returned URL after the
+# fact breaks the signature (SignatureDoesNotMatch), so download links handed
+# to the frontend must be signed against a browser-reachable host to begin
+# with. This client exists only for that; every other MinIO call above still
+# goes through minio_client on the internal network.
+minio_public_client = Minio(
+    os.environ.get("MINIO_PUBLIC_ENDPOINT", "localhost:9000"),
+    access_key=os.environ.get("MINIO_ROOT_USER"),
+    secret_key=os.environ.get("MINIO_ROOT_PASSWORD"),
+    secure=False,
+    # Without an explicit region, minio-py's presigned_get_object() calls
+    # GetBucketLocation against the configured host to discover it — which
+    # would try to reach "localhost:9000" from inside this container (where
+    # localhost isn't MinIO) and fail. SigV4 signing itself needs no
+    # connectivity; setting the region short-circuits that lookup so this
+    # client never needs to actually be reachable, only correct in the URL
+    # it signs.
+    region="us-east-1",
+)
+
 
 # -------------------------------------------------------------------------
 # ENDPOINTS
@@ -416,11 +519,24 @@ async def batch_upload(
     except Exception:
         BATCH_UPLOADS_TOTAL.labels(tenant_id=tenant, status="invalid").inc()   # ← track
         raise HTTPException(status_code=400, detail="Invalid CSV file")
-    
+
     # empty file check
     if row_count == 0:
         BATCH_UPLOADS_TOTAL.labels(tenant_id=tenant, status="invalid").inc()   # ← track
         raise HTTPException(status_code=400, detail="CSV file has no rows")
+
+    # Required-column check — mirrors LoanApplication's required fields. Without
+    # this, a CSV missing e.g. loan_amount would still get queued, and
+    # FeaturePipeline.transform()'s reindex() silently fills the whole absent
+    # column with the training-set median rather than failing loudly.
+    required_columns = {"ID", "year", "loan_amount", "property_value", "income", "Credit_Score"}
+    missing_columns = required_columns - set(df.columns)
+    if missing_columns:
+        BATCH_UPLOADS_TOTAL.labels(tenant_id=tenant, status="invalid").inc()   # ← track
+        raise HTTPException(
+            status_code=400,
+            detail=f"CSV is missing required column(s): {', '.join(sorted(missing_columns))}",
+        )
 
     # Check and increment tenant's monthly quota
     try:
@@ -453,6 +569,10 @@ async def batch_upload(
     # ── Track job status in Redis so /v1/batch/results/{job_id} can poll it ──
     redis_client.set(f"job:{job_id}:status", "queued", ex=86400)
     redis_client.set(f"job:{job_id}:tenant", tenant,   ex=86400)
+
+    # ── Index this job under the tenant so GET /v1/batch/jobs can list it ────
+    redis_client.lpush(f"jobs:{tenant}", job_id)
+    redis_client.expire(f"jobs:{tenant}", 60 * 60 * 24 * 30)
 
     # ── Enqueue Celery scoring task ───────────────────────────────────────────
     if _celery_app:
@@ -512,7 +632,7 @@ async def batch_results(
     if job_status == "complete":
         result_object = redis_client.get(f"job:{job_id}:result_object")
         rows_scored   = redis_client.get(f"job:{job_id}:rows_scored")
-        download_url  = minio_client.presigned_get_object(
+        download_url  = minio_public_client.presigned_get_object(
             "batch-results", result_object, expires=timedelta(hours=1)
         )
         response.update({
@@ -524,6 +644,129 @@ async def batch_results(
         response["error"] = redis_client.get(f"job:{job_id}:error")
 
     return response
+
+
+@app.get("/v1/batch/jobs", summary="List this tenant's batch job history")
+async def batch_jobs(
+    token: Optional[HTTPAuthorizationCredentials] = Security(security_scheme),
+):
+    """Most recent 50 batch jobs for the caller's tenant — job_id + status
+    only; call GET /v1/batch/results/{job_id} for the full detail (download
+    URL, rows scored, error) of any one of them."""
+    tenant = verify_token(token)
+    job_ids = redis_client.lrange(f"jobs:{tenant}", 0, 49)
+    jobs = [
+        {"job_id": job_id, "status": redis_client.get(f"job:{job_id}:status")}
+        for job_id in job_ids
+    ]
+    return {"jobs": jobs}
+
+
+@app.get("/v1/usage", summary="This tenant's current-month prediction quota usage")
+async def usage(
+    token: Optional[HTTPAuthorizationCredentials] = Security(security_scheme),
+):
+    tenant = verify_token(token)
+    month  = datetime.utcnow().strftime("%Y_%m")
+    used   = int(redis_client.get(f"quota:{tenant}:{month}") or 0)
+    return {
+        "tenant_id": tenant,
+        "month":     datetime.utcnow().strftime("%Y-%m"),
+        "used":      used,
+        "limit":     MONTHLY_QUOTA_LIMIT,
+    }
+
+
+@app.get("/v1/predictions/history", summary="This tenant's recent predictions")
+async def predictions_history(
+    token: Optional[HTTPAuthorizationCredentials] = Security(security_scheme),
+):
+    tenant = verify_token(token)
+    client = get_ch_client()
+    if client is None:
+        return {"predictions": []}
+    try:
+        result = client.query(
+            "SELECT application_id, probability, prediction, model_version, ts "
+            "FROM prediction_logs WHERE tenant_id = {tenant_id:String} "
+            "ORDER BY ts DESC LIMIT 50",
+            parameters={"tenant_id": tenant},
+        )
+        predictions = [
+            {
+                "application_id": row[0],
+                "probability":    row[1],
+                "prediction":     row[2],
+                "model_version":  row[3],
+                "timestamp":      row[4].isoformat(),
+            }
+            for row in result.result_rows
+        ]
+    except Exception as e:
+        print(f"[WARNING] predictions history query failed: {e}")
+        predictions = []
+    return {"predictions": predictions}
+
+
+@app.get("/admin/tenants", summary="Cross-tenant usage summary (admin only)")
+async def admin_tenants(admin_user: dict = Depends(require_admin)):
+    from app.db import get_cursor
+
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT tenant_id, name, invite_code, created_at FROM app.tenants "
+            "ORDER BY created_at DESC"
+        )
+        tenants = cur.fetchall()
+
+    month = datetime.utcnow().strftime("%Y_%m")
+    result = []
+    for t in tenants:
+        with get_cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM app.users WHERE tenant_id = %s",
+                (t["tenant_id"],),
+            )
+            user_count = cur.fetchone()["n"]
+        used = int(redis_client.get(f"quota:{t['tenant_id']}:{month}") or 0)
+        result.append({
+            "tenant_id":   t["tenant_id"],
+            "name":        t["name"],
+            "created_at":  t["created_at"].isoformat(),
+            "user_count":  user_count,
+            "quota_used":  used,
+            "quota_limit": MONTHLY_QUOTA_LIMIT,
+        })
+    return {"tenants": result}
+
+
+@app.get("/v1/labeled-data/history", summary="This tenant's recent labeled-data uploads")
+async def labeled_data_history(
+    token: Optional[HTTPAuthorizationCredentials] = Security(security_scheme),
+):
+    tenant = verify_token(token)
+    client = get_ch_client()
+    if client is None:
+        return {"uploads": []}
+    try:
+        result = client.query(
+            "SELECT object_name, rows_received, ts "
+            "FROM labeled_uploads WHERE tenant_id = {tenant_id:String} "
+            "ORDER BY ts DESC LIMIT 50",
+            parameters={"tenant_id": tenant},
+        )
+        uploads = [
+            {
+                "object_name":   row[0],
+                "rows_received": row[1],
+                "timestamp":     row[2].isoformat(),
+            }
+            for row in result.result_rows
+        ]
+    except Exception as e:
+        print(f"[WARNING] labeled-data history query failed: {e}")
+        uploads = []
+    return {"uploads": uploads}
 
 
 @app.post(

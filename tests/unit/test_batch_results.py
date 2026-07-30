@@ -107,7 +107,7 @@ def test_complete_status_includes_download_url():
         if "rows_scored"   in key: return "50"
         return None
     with patch("app.main.redis_client") as mock_r, \
-         patch("app.main.minio_client") as mock_minio:
+         patch("app.main.minio_public_client") as mock_minio:
         mock_r.get.side_effect = side_effect
         mock_minio.presigned_get_object.return_value = "http://minio/signed-url"
         body = get_results().json()
@@ -123,7 +123,7 @@ def test_complete_rows_scored_is_integer():
         if "rows_scored"   in key: return "75"
         return None
     with patch("app.main.redis_client") as mock_r, \
-         patch("app.main.minio_client") as mock_minio:
+         patch("app.main.minio_public_client") as mock_minio:
         mock_r.get.side_effect = side_effect
         mock_minio.presigned_get_object.return_value = "http://signed"
         body = get_results().json()
@@ -138,7 +138,7 @@ def test_complete_presigned_url_uses_batch_results_bucket():
         if "rows_scored"   in key: return "10"
         return None
     with patch("app.main.redis_client") as mock_r, \
-         patch("app.main.minio_client") as mock_minio:
+         patch("app.main.minio_public_client") as mock_minio:
         mock_r.get.side_effect = side_effect
         mock_minio.presigned_get_object.return_value = "http://signed"
         get_results()
