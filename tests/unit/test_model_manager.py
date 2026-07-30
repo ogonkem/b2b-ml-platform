@@ -12,14 +12,7 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
-# ── Patch MlflowClient at module level so __init__ never calls real MLflow ────
-mlflow_patcher = patch("app.model_manager.mlflow.tracking.MlflowClient")
-mock_client_cls = mlflow_patcher.start()
-mock_client_cls.return_value = MagicMock()
-
 from app.model_manager import ModelManager
-
-# Stop patch after import if you want (optional — keeping it running is fine for tests)
 
 
 @pytest.fixture

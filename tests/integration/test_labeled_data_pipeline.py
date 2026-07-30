@@ -1,15 +1,19 @@
 # Requires full docker stack running: docker compose up -d
 # Run after containers are healthy (allow ~60s for startup).
-import io, csv, os
+import io, csv
 import pytest
 import httpx
 from pathlib import Path
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
-load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+# Read .env directly (not load_dotenv) so tokens match the running container
+# without mutating the real process environment — that leaks vars like
+# AIRFLOW__DATABASE__SQL_ALCHEMY_CONN into any test that runs later in the
+# same pytest session, including unrelated unit tests that import airflow.
+_env = dotenv_values(Path(__file__).resolve().parent.parent.parent / ".env")
 
 BASE_URL  = "http://localhost:8000"
-_raw      = os.environ.get("API_TOKENS", "dev-token")
+_raw      = _env.get("API_TOKENS", "dev-token")
 API_TOKEN = _raw.split(",")[0].strip()
 HEADERS   = {"Authorization": f"Bearer {API_TOKEN}"}
 
