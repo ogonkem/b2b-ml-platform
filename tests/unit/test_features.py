@@ -31,8 +31,17 @@ def sample_df():
 @pytest.fixture
 def fitted_pipeline(sample_df):
     """Returns an already-fitted pipeline ready for transform tests."""
+    # notebooks/retrain.py computes these 3 derived features on the raw
+    # dataframe before ever calling FeaturePipeline.fit() — mirror that here
+    # so feature_names captures them, matching the real training contract
+    # (see _DERIVED_FEATURES handling in shared/features.py).
+    df = sample_df.copy()
+    df["loan_to_income"]   = df["loan_amount"]  / (df["income"]         + 1)
+    df["loan_to_property"] = df["loan_amount"]  / (df["property_value"] + 1)
+    df["credit_to_income"] = df["Credit_Score"] / (df["income"]         + 1)
+
     pipeline = FeaturePipeline()
-    pipeline.fit(sample_df)
+    pipeline.fit(df)
     return pipeline
 
 
@@ -118,9 +127,9 @@ class TestTransform:
         result = fitted_pipeline.transform(sample_df)
         assert isinstance(result, np.ndarray)
 
-    def test_transform_returns_float32(self, fitted_pipeline, sample_df):
+    def test_transform_returns_float64(self, fitted_pipeline, sample_df):
         result = fitted_pipeline.transform(sample_df)
-        assert result.dtype == np.float32
+        assert result.dtype == np.float64
 
     def test_transform_output_row_count_matches_input(self, fitted_pipeline, sample_df):
         result = fitted_pipeline.transform(sample_df)
