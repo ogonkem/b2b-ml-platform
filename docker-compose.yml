@@ -72,7 +72,10 @@ services:
     networks:
       - backend-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8123/ping"]
+      # curl isn't installed in this image (wget is) — a missing binary makes
+      # the healthcheck command itself fail, reporting "unhealthy" regardless
+      # of whether ClickHouse is actually up.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
       interval: 10s
       timeout: 5s
       retries: 10         # ← more retries
@@ -89,11 +92,24 @@ services:
       - .env
     ports:
       - "5000:5000"
+    volumes:
+      # BACKEND_STORE_URI's sqlite file lives here — without this mount the
+      # entire model registry and experiment history is wiped every time the
+      # container is recreated (recreating for an unrelated healthcheck fix
+      # this session did exactly that).
+      - ./docker-data/mlflow:/mlflow-data
+    # --backend-store-uri was missing entirely — mlflow server doesn't read
+    # BACKEND_STORE_URI as an env var, so it silently fell back to its own
+    # default (sqlite:///mlflow.db, relative to the container's CWD) every
+    # time, ignoring .env and the volume above. ${BACKEND_STORE_URI} here is
+    # substituted by docker compose itself from .env before the container
+    # ever sees it (same mechanism postgres's healthcheck already uses).
     command: >
-      mlflow server 
-      --host 0.0.0.0 
+      mlflow server
+      --host 0.0.0.0
       --port 5000
       --allowed-hosts "mlflow,mlflow:5000,localhost,localhost:5000,*"
+      --backend-store-uri "${BACKEND_STORE_URI}"
       --default-artifact-root s3://mlflow-artifacts/
     depends_on:
       minio:
@@ -101,7 +117,10 @@ services:
     networks:
       - backend-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000"]
+      # curl isn't installed in this image — a missing binary makes the
+      # healthcheck command itself fail, reporting "unhealthy" regardless of
+      # whether MLflow is actually up. Python is always present here.
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:5000')"]
       interval: 15s
       timeout: 10s
       retries: 10
@@ -165,7 +184,10 @@ services:
     networks:
       - backend-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      # curl isn't installed in this image (python:3.12-slim) — a missing
+      # binary makes the healthcheck command itself fail, reporting
+      # "unhealthy" regardless of whether the API is actually up.
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health')"]
       interval: 30s
       timeout: 5s
       retries: 3

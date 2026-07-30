@@ -1,0 +1,37 @@
+name: Unit tests
+
+# Runs the fast, fully self-contained test suite (all external calls mocked,
+# no live services needed) on every push and PR against main.
+#
+# tests/integration/ and lifecycle_tests/ are intentionally NOT run here —
+# both need the full docker-compose stack up (10 services, including a
+# multi-minute custom Airflow image build), which is a heavier, separate
+# piece of CI infrastructure to wire up. See lifecycle_tests/README.md for
+# how to run those locally.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          # Pinned: apache-airflow==3.3.0 breaks this repo's DAG imports
+          # (ImportError: cannot import name 'ObjectStoragePath' from
+          # airflow.sdk) — verified against a clean venv before pinning this.
+          pip install pytest pytest-asyncio "apache-airflow==3.2.2"
+
+      - name: Run unit tests
+        run: python -m pytest tests/unit -v

@@ -21,6 +21,7 @@ with patch("redis.Redis") as mock_redis, \
     mock_redis.return_value = MagicMock()
     mock_ch.return_value    = MagicMock()
     from fastapi.testclient import TestClient
+    import app.main as app_main
     from app.main import app
 
 client = TestClient(app)
@@ -148,3 +149,23 @@ def test_same_input_returns_same_output():
          patch("app.main.log_prediction"):
         results = [predict().json()["default_probability"] for _ in range(3)]
         assert len(set(results)) == 1
+
+
+# ── Field name mapping (co-applicant_credit_type) ────────────────────────────
+# The trained column name has a hyphen (straight from the source CSV); JSON /
+# pydantic field names can't contain one, so predict_default() must rename it
+# before calling feature_pipeline.transform() — otherwise it's silently
+# treated as missing on every request, regardless of what the caller sent.
+
+def test_co_applicant_field_renamed_before_transform():
+    payload = {**VALID_PAYLOAD, "co_applicant_credit_type": "CIB"}
+    with patch("app.main.check_and_increment_quota", return_value=1), \
+         patch("app.main.log_prediction"), \
+         patch.object(app_main.feature_pipeline, "transform",
+                      wraps=app_main.feature_pipeline.transform) as mock_transform:
+        assert predict(payload=payload).status_code == 200
+
+    called_df = mock_transform.call_args[0][0]
+    assert "co-applicant_credit_type" in called_df.columns
+    assert "co_applicant_credit_type" not in called_df.columns
+    assert called_df["co-applicant_credit_type"].iloc[0] == "CIB"
