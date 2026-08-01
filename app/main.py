@@ -802,9 +802,12 @@ async def paystack_webhook(request: Request):
     data = event.get("data", {})
 
     try:
-        from app.db import get_tenant_id_by_email, set_tenant_subscription
+        from app.db import get_tenant_id_by_email, get_tenant_row, set_tenant_subscription
         from app.payments import PAYSTACK_PLAN_CODES
-        if event_type in ("subscription.create", "charge.success"):
+        if event_type == "subscription.create":
+            # Fires with a real subscription_code already in its payload —
+            # e.g. echoing back the subscription this same handler creates
+            # below in response to charge.success. Idempotent either way.
             email = data.get("customer", {}).get("email")
             plan_code = data.get("plan", {}).get("plan_code")
             tenant_id = get_tenant_id_by_email(email) if email else None
@@ -816,8 +819,43 @@ async def paystack_webhook(request: Request):
                     subscription_code=data.get("subscription_code", ""),
                     status="active",
                 )
+        elif event_type == "charge.success":
+            # Attaching a `plan` to /transaction/initialize only charges
+            # once for that plan's amount — confirmed against a real
+            # Paystack account, which had no subscription record at all
+            # after a successful plan-attached charge. The recurring
+            # subscription has to be created explicitly using the card
+            # authorization from this first successful charge.
+            email = data.get("customer", {}).get("email")
+            plan_code = data.get("plan", {}).get("plan_code")
+            tenant_id = get_tenant_id_by_email(email) if email else None
+            plan_id = next((p for p, code in PAYSTACK_PLAN_CODES.items() if code == plan_code), None)
+            if tenant_id and plan_id:
+                existing = get_tenant_row(tenant_id) or {}
+                if existing.get("subscription_status") == "active" and existing.get("paystack_subscription_code"):
+                    # A renewal charge (or a redelivered webhook) against a
+                    # subscription that already exists — every charge after
+                    # the first is Paystack's own recurring billing, not a
+                    # new signup, so there's nothing new to create.
+                    pass
+                else:
+                    customer_code = data.get("customer", {}).get("customer_code")
+                    auth_code = data.get("authorization", {}).get("authorization_code")
+                    subscription_code = ""
+                    if customer_code and auth_code:
+                        from app.payments import create_subscription
+                        try:
+                            sub = create_subscription(customer_code, plan_code, auth_code)
+                            subscription_code = sub.get("subscription_code", "")
+                        except Exception as e:
+                            print(f"[WARNING] Failed to create Paystack subscription for tenant={tenant_id}: {e}")
+                    set_tenant_subscription(
+                        tenant_id, plan_id,
+                        customer_code=customer_code,
+                        subscription_code=subscription_code,
+                        status="active",
+                    )
         elif event_type in ("subscription.disable", "subscription.not_renew"):
-            from app.db import get_tenant_row
             email = data.get("customer", {}).get("email")
             tenant_id = get_tenant_id_by_email(email) if email else None
             if tenant_id:

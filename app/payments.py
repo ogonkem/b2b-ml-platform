@@ -60,6 +60,23 @@ def initialize_transaction(email: str, plan_code: str, amount_subunits: int, cal
     return resp.json()["data"]
 
 
+def create_subscription(customer_code: str, plan_code: str, authorization_code: str) -> dict:
+    """Attaching a `plan` to /transaction/initialize only charges once for
+    that plan's amount — confirmed against a real Paystack account, which
+    had no subscription record at all after a successful plan-attached
+    charge. The recurring subscription itself has to be created
+    explicitly, using the reusable card authorization from that first
+    successful charge. Returns {"subscription_code": ..., ...}."""
+    resp = requests.post(
+        f"{PAYSTACK_BASE_URL}/subscription",
+        headers=_headers(),
+        json={"customer": customer_code, "plan": plan_code, "authorization": authorization_code},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()["data"]
+
+
 def get_manage_link(subscription_code: str) -> str:
     """A Paystack-hosted page where the customer can update their card or
     cancel the subscription — the billing-portal equivalent."""

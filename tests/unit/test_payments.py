@@ -124,6 +124,59 @@ def test_webhook_subscription_create_updates_tenant_plan():
         "tenant-xyz", "starter", customer_code="CUS_1", subscription_code="SUB_1", status="active"
     )
 
+def test_webhook_charge_success_creates_real_subscription():
+    """Attaching a plan to /transaction/initialize only charges once — the
+    recurring subscription itself has to be created explicitly using the
+    authorization from this first successful charge."""
+    body = json.dumps({
+        "event": "charge.success",
+        "data": {
+            "customer": {"email": "payer@example.com", "customer_code": "CUS_1"},
+            "plan": {"plan_code": "PLN_starter_test"},
+            "authorization": {"authorization_code": "AUTH_1"},
+        },
+    }).encode()
+    with patch("app.db.get_tenant_id_by_email", return_value="tenant-xyz"), \
+         patch("app.db.get_tenant_row", return_value={"subscription_status": "none"}), \
+         patch("app.payments.create_subscription", return_value={"subscription_code": "SUB_new"}) as mock_create, \
+         patch("app.db.set_tenant_subscription") as mock_set:
+        r = client.post(
+            "/webhooks/paystack",
+            content=body,
+            headers={"x-paystack-signature": _sign(body), "Content-Type": "application/json"},
+        )
+    assert r.status_code == 200
+    mock_create.assert_called_once_with("CUS_1", "PLN_starter_test", "AUTH_1")
+    mock_set.assert_called_once_with(
+        "tenant-xyz", "starter", customer_code="CUS_1", subscription_code="SUB_new", status="active"
+    )
+
+def test_webhook_charge_success_skips_renewal_for_existing_subscription():
+    """A renewal charge (or a redelivered webhook) against a subscription
+    that already exists must not create a second, duplicate subscription."""
+    body = json.dumps({
+        "event": "charge.success",
+        "data": {
+            "customer": {"email": "payer@example.com", "customer_code": "CUS_1"},
+            "plan": {"plan_code": "PLN_starter_test"},
+            "authorization": {"authorization_code": "AUTH_2"},
+        },
+    }).encode()
+    with patch("app.db.get_tenant_id_by_email", return_value="tenant-xyz"), \
+         patch("app.db.get_tenant_row", return_value={
+             "subscription_status": "active", "paystack_subscription_code": "SUB_existing"
+         }), \
+         patch("app.payments.create_subscription") as mock_create, \
+         patch("app.db.set_tenant_subscription") as mock_set:
+        r = client.post(
+            "/webhooks/paystack",
+            content=body,
+            headers={"x-paystack-signature": _sign(body), "Content-Type": "application/json"},
+        )
+    assert r.status_code == 200
+    mock_create.assert_not_called()
+    mock_set.assert_not_called()
+
 def test_webhook_subscription_disable_reverts_to_free():
     body = json.dumps({
         "event": "subscription.disable",
