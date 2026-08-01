@@ -66,6 +66,19 @@ const icons = {
       <path d="M12 3 5 5.5v5.2c0 4.6 3 8.4 7 9.8 4-1.4 7-5.2 7-9.8V5.5Z" />
     </Icon>
   ),
+  plans: (
+    <Icon>
+      <path d="M12 3 3 8.5 12 14l9-5.5Z" />
+      <path d="M3 13l9 5.5 9-5.5" />
+    </Icon>
+  ),
+  docs: (
+    <Icon>
+      <path d="M6.5 3.5h8l4 4v13a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-16a1 1 0 0 1 1-1Z" />
+      <path d="M14.5 3.5v4h4" />
+      <path d="M8.5 13h7M8.5 16.5h7" />
+    </Icon>
+  ),
   collapse: (
     <Icon>
       <rect x="3.5" y="4.5" width="17" height="15" rx="2" />
@@ -105,6 +118,8 @@ const NAV_ITEMS: { to: string; label: string; icon: keyof typeof icons }[] = [
   { to: "/batch", label: "Batch Upload", icon: "batch" },
   { to: "/labeled-data", label: "Labeled Data", icon: "labeled" },
   { to: "/usage", label: "Usage", icon: "usage" },
+  { to: "/plans", label: "Plans", icon: "plans" },
+  { to: "/api-docs", label: "API Docs", icon: "docs" },
   { to: "/account", label: "Account", icon: "account" },
 ];
 

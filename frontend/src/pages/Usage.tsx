@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { Link } from "react-router-dom";
 import { apiGet } from "../api/client";
 
 interface UsageResponse {
@@ -6,6 +7,7 @@ interface UsageResponse {
   month: string;
   used: number;
   limit: number;
+  plan: string;
 }
 interface PredictionRecord {
   application_id: number;
@@ -36,7 +38,8 @@ export default function Usage() {
       {usage && (
         <div className="quota-bar-wrap">
           <p>
-            {usage.used} / {usage.limit} predictions used this month ({usage.month})
+            <span className="plan-tag">{usage.plan} plan</span> — {usage.used} / {usage.limit} predictions
+            used this month ({usage.month}). <Link to="/plans">Change plan</Link>
           </p>
           <div className="quota-bar">
             <div className="quota-bar-fill" style={{ width: `${pct}%` }} />

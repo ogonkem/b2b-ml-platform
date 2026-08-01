@@ -25,6 +25,8 @@ with patch("redis.Redis") as mock_redis_cls, \
     import app.main as main_module
     from app.main import app
 
+from app.plans import PLANS, DEFAULT_PLAN
+
 client = TestClient(app)
 HEADERS = {"Authorization": "Bearer dev-token"}
 
@@ -43,12 +45,17 @@ def _mock_cursor_cm(fetchone_results=None):
 # ── GET /v1/usage ─────────────────────────────────────────────────────────────
 
 def test_usage_reads_current_quota():
+    """No app.tenants row for this static token (psycopg2 is mocked, so the
+    cursor's fetchone() returns a non-matching MagicMock rather than a real
+    row) — get_tenant_plan falls back to the default plan, exactly like it
+    would for a real, never-registered static API_TOKENS tenant."""
     with patch.object(main_module.redis_client, "get", return_value="42"):
         r = client.get("/v1/usage", headers=HEADERS)
     assert r.status_code == 200
     body = r.json()
     assert body["used"] == 42
-    assert body["limit"] == main_module.MONTHLY_QUOTA_LIMIT
+    assert body["plan"] == DEFAULT_PLAN
+    assert body["limit"] == PLANS[DEFAULT_PLAN]["monthly_quota"]
 
 def test_usage_defaults_to_zero_when_no_key():
     with patch.object(main_module.redis_client, "get", return_value=None):

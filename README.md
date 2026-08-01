@@ -362,7 +362,37 @@ Four read endpoints back the UI, all resolving `tenant_id` through the same unif
 | `GET /v1/usage` | Usage page — reads the same `quota:{tenant}:{month}` Redis key `check_and_increment_quota` writes |
 | `GET /v1/batch/jobs` | Batch page's job history — a Redis list (`jobs:{tenant}`) pushed to alongside the existing per-job status keys |
 | `GET /v1/predictions/history` | Usage page's recent-predictions table — queried from the ClickHouse `prediction_logs` table |
-| `GET /admin/tenants` | Admin page — every tenant's quota usage and user count (`admin` role only) |
+| `GET /admin/tenants` | Admin page — every tenant's quota usage, plan, and user count (`admin` role only) |
+
+### Subscription tiers
+
+Each tenant has a `plan` (`app.tenants.plan`, defaulting to `free`) that determines its monthly quota — the catalog lives in `app/plans.py`, not the database, so tiers are a code change, not a migration:
+
+| Plan | Monthly quota | Price |
+|---|---|---|
+| Free | 100 | $0/mo |
+| Starter | 1,000 | $49/mo |
+| Pro | 5,000 | $199/mo |
+| Enterprise | 25,000 | Contact us |
+
+`GET /v1/plans` lists the catalog. Switching to `free` is an instant, self-service `POST /v1/tenant/plan` — a static `API_TOKENS` value has no `app.tenants` row to update and gets a clear rejection pointing at `/auth/register` instead of a silent no-op; it stays on the `free` limit exactly like before this feature existed. Starter and Pro have a real fixed USD price and are billed through Paystack instead (below); Enterprise has no fixed price (`price_amount: None` in `app/plans.py`) and is sales-assisted, never sold through checkout. The frontend's `/plans` page renders the catalog as tier cards; `/usage` shows the active plan next to the quota bar.
+
+### Billing (Paystack)
+
+Starter and Pro are real, paid subscriptions — collected through Paystack's hosted Checkout, so no card data ever reaches this app.
+
+- **`POST /v1/tenant/checkout`** (`app/payments.py`, `app/main.py`) — starts a transaction for the caller's tenant against that tier's Paystack Plan object and returns a hosted `authorization_url` to redirect the browser to. Paystack requires an explicit `amount` even when a `plan` code is given — it does not infer the charge from the plan's own configured price. `app/plans.py`'s prices are USD-denominated (the displayed "$49/mo" labels); `usd_to_paystack_subunits()` converts to whatever currency the Paystack account is configured for (`PAYSTACK_CURRENCY`) at a fixed, test/demo-grade rate — not a live FX lookup.
+- **`POST /webhooks/paystack`** — the source of truth for entitlement changes. Verifies `x-paystack-signature` (HMAC-SHA512 of the raw body using the same secret key — Paystack has no separate webhook secret) before processing anything. `subscription.create`/`charge.success` resolve the tenant from the paying customer's email (matched against `app.users`) and promote it to the paid tier; `subscription.disable`/`subscription.not_renew` revert it to `free`. Always returns 200 once the signature checks out, even if internal processing fails, so Paystack doesn't retry-storm the endpoint over a transient DB hiccup.
+- **`GET /v1/tenant/billing-portal`** — returns a Paystack-hosted subscription-management link (`/subscription/{code}/manage/link`) where a tenant can update their card or cancel; the closest equivalent Paystack has to a full billing portal.
+- **The cancel guard**: `POST /v1/tenant/plan` refuses a direct switch to `free` while `subscription_status = active` — without it, a tenant could downgrade their quota entitlement locally while Paystack keeps billing them for the paid plan. Cancelling has to go through the billing portal; the webhook is what actually flips the tenant back to `free` once that cancellation lands.
+
+**One-time setup** — `scripts/setup_paystack_plans.py` reads `app/plans.py`'s paid tiers and creates matching Paystack Plan objects via their API (skipping `free` and `enterprise`), printing the resulting plan codes to paste into `.env` as `PAYSTACK_PLAN_STARTER` / `PAYSTACK_PLAN_PRO`. Run it once after setting `PAYSTACK_SECRET_KEY` and `PAYSTACK_CURRENCY`.
+
+**Testing locally**: the automated test suite (`tests/unit/test_payments.py`) mocks every Paystack call — no real key or network needed. To see a real webhook fire end-to-end, tunnel the local API with something like `ngrok http 8000` and register `<tunnel-url>/webhooks/paystack` in Paystack's dashboard webhook settings, then complete a checkout using Paystack's test-mode payment simulator (its hosted checkout page offers one-click "Success" / "Bank Authentication" / "Declined" options in test mode — no real card number needed).
+
+### API documentation
+
+The `/api-docs` page in the frontend is a curated reference for anyone integrating directly against the API — the three auth methods `verify_token()` accepts (static token, JWT, or an `sk_…` key from `/auth/api-key`), an endpoint table, and real `curl` examples using the schema `LoanApplication` actually expects. It links out to the auto-generated Swagger UI (`/docs` on the API itself) for the full request/response schema and a live try-it-out console.
 
 ### Frontend
 
@@ -420,7 +450,11 @@ python -m pytest tests/integration/ -v
 │   ├── main.py              # FastAPI: /v1/predict, /v1/batch/upload, /v1/labeled-data, dashboard endpoints
 │   ├── auth.py              # /auth/register, /auth/login, /auth/me, /auth/api-key (see §11)
 │   ├── db.py                # Postgres app schema: tenants / users / api_keys, idempotent DDL
+│   ├── plans.py             # Subscription tier catalog (see §11)
+│   ├── payments.py          # Paystack client: checkout, webhook signature, billing portal (see §11)
 │   └── model_manager.py     # Polling hot-swap daemon — threading.Lock + MLflow registry
+├── scripts/
+│   └── setup_paystack_plans.py  # One-time: creates Paystack Plan objects from app/plans.py (see §11)
 ├── frontend/                # React + Vite + TS SPA — login/dashboard/predict/batch/usage/admin (see §11)
 ├── shared/
 │   ├── features.py          # FeaturePipeline: fit/transform, imputation, derived features

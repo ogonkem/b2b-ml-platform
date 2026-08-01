@@ -4,7 +4,7 @@ from typing import Dict, Any, Optional
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from fastapi import Depends, FastAPI, HTTPException, Security, status, UploadFile, File
+from fastapi import Depends, FastAPI, HTTPException, Request, Security, status, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -19,6 +19,7 @@ from io import BytesIO
 from prometheus_client import Counter, Histogram, make_asgi_app
 import time
 from app.model_manager import ModelManager
+from app.plans import PLANS, DEFAULT_PLAN
 
 try:
     from celery_worker.celery_app import celery_app as _celery_app
@@ -63,7 +64,7 @@ async def no_store_cache(request, call_next):
     response.headers["Cache-Control"] = "no-store"
     return response
 
-from app.auth import router as auth_router, require_admin
+from app.auth import router as auth_router, require_admin, get_current_user
 app.include_router(auth_router)
 
 # -------------------------------------------------------------------------
@@ -288,7 +289,7 @@ redis_client = redis.Redis(
     decode_responses=True
 )
 
-MONTHLY_QUOTA_LIMIT = 1000  # shared with GET /v1/usage and GET /admin/tenants below
+MONTHLY_QUOTA_LIMIT = 1000  # fallback default only — real callers pass monthly_limit=get_plan_quota(tenant)
 
 def check_and_increment_quota(tenant_id: str, increment: int = 1, monthly_limit: int = MONTHLY_QUOTA_LIMIT):
     """
@@ -313,6 +314,16 @@ def check_and_increment_quota(tenant_id: str, increment: int = 1, monthly_limit:
         # Key was just created (or reset); set ~1-month TTL for automatic reset
         redis_client.expire(key, 60 * 60 * 24 * 32)
     return current
+
+
+def get_plan_quota(tenant_id: str) -> int:
+    """The real limit check_and_increment_quota should enforce for this
+    tenant, based on its subscription plan — kept separate from
+    check_and_increment_quota itself so that function stays pure-Redis
+    with no Postgres dependency on its hot path's unit tests."""
+    from app.db import get_tenant_plan
+    plan = get_tenant_plan(tenant_id)
+    return PLANS.get(plan, PLANS[DEFAULT_PLAN])["monthly_quota"]
 
 # -------------------------------------------------------------------------
 # ClickHouse client initialization (for future logging of predictions and usage)
@@ -435,7 +446,7 @@ async def predict_default(
     token: Optional[HTTPAuthorizationCredentials] = Security(security_scheme)
 ):
     tenant = verify_token(token)
-    check_and_increment_quota(tenant)
+    check_and_increment_quota(tenant, monthly_limit=get_plan_quota(tenant))
 
     start = time.time() # start timer
     try:
@@ -540,7 +551,7 @@ async def batch_upload(
 
     # Check and increment tenant's monthly quota
     try:
-        check_and_increment_quota(tenant, row_count)
+        check_and_increment_quota(tenant, row_count, monthly_limit=get_plan_quota(tenant))
     except Exception:
         BATCH_UPLOADS_TOTAL.labels(tenant_id=tenant, status="quota_exceeded").inc()  # ← track
         raise HTTPException(status_code=429, detail="Quota exceeded")
@@ -667,14 +678,186 @@ async def usage(
     token: Optional[HTTPAuthorizationCredentials] = Security(security_scheme),
 ):
     tenant = verify_token(token)
+    from app.db import get_tenant_plan
+    plan   = get_tenant_plan(tenant)
     month  = datetime.utcnow().strftime("%Y_%m")
     used   = int(redis_client.get(f"quota:{tenant}:{month}") or 0)
     return {
         "tenant_id": tenant,
         "month":     datetime.utcnow().strftime("%Y-%m"),
         "used":      used,
-        "limit":     MONTHLY_QUOTA_LIMIT,
+        "limit":     PLANS.get(plan, PLANS[DEFAULT_PLAN])["monthly_quota"],
+        "plan":      plan,
     }
+
+
+@app.get("/v1/plans", summary="Available subscription tiers")
+async def list_plans(
+    token: Optional[HTTPAuthorizationCredentials] = Security(security_scheme),
+):
+    verify_token(token)
+    return {"plans": [{"id": plan_id, **details} for plan_id, details in PLANS.items()]}
+
+
+class PlanChangeRequest(BaseModel):
+    plan: str
+
+
+@app.post("/v1/tenant/plan", summary="Change this tenant's subscription plan")
+async def change_plan(
+    payload: PlanChangeRequest,
+    token: Optional[HTTPAuthorizationCredentials] = Security(security_scheme),
+):
+    tenant = verify_token(token)
+    if payload.plan not in PLANS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown plan '{payload.plan}'. Valid plans: {', '.join(PLANS)}",
+        )
+    from app.db import get_tenant_row, set_tenant_plan
+    if payload.plan == "free":
+        # Switching straight to free while Paystack still has an active
+        # subscription would leave the tenant billed for a plan they no
+        # longer have entitlement to — cancellation has to go through the
+        # billing portal (GET /v1/tenant/billing-portal) first; the webhook
+        # is what actually flips plan+subscription_status once that
+        # cancellation lands, not this endpoint.
+        row = get_tenant_row(tenant)
+        if row and row.get("subscription_status") == "active":
+            raise HTTPException(
+                status_code=400,
+                detail="You have an active paid subscription — cancel it from the "
+                        "billing portal (GET /v1/tenant/billing-portal) rather than "
+                        "switching plans directly, so billing and quota stay in sync.",
+            )
+    updated = set_tenant_plan(tenant, payload.plan)
+    if not updated:
+        raise HTTPException(
+            status_code=400,
+            detail="Plan management requires a registered account — static API "
+                    "tokens aren't tied to a tenant row. Register via /auth/register.",
+        )
+    return {
+        "tenant_id": tenant,
+        "plan": payload.plan,
+        "monthly_quota": PLANS[payload.plan]["monthly_quota"],
+    }
+
+
+@app.post("/v1/tenant/checkout", summary="Start a Paystack checkout for a paid plan")
+async def start_checkout(payload: PlanChangeRequest, user: dict = Depends(get_current_user)):
+    """Requires a real JWT, not a static token or API key — Paystack needs
+    an email address for the checkout, which only a logged-in user has.
+    Enterprise has no fixed price and is sales-assisted, so it's never in
+    CHECKOUT_PLANS and can't be started here."""
+    from app.plans import CHECKOUT_PLANS
+    if payload.plan not in CHECKOUT_PLANS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{payload.plan}' isn't sold through checkout. Available: {', '.join(CHECKOUT_PLANS)}",
+        )
+    from app.payments import PAYSTACK_PLAN_CODES, initialize_transaction, usd_to_paystack_subunits
+    plan_code = PAYSTACK_PLAN_CODES.get(payload.plan)
+    if not plan_code:
+        raise HTTPException(
+            status_code=500,
+            detail=f"No Paystack plan code configured for '{payload.plan}' — run "
+                    "scripts/setup_paystack_plans.py and set PAYSTACK_PLAN_"
+                    f"{payload.plan.upper()} in .env.",
+        )
+    from app.db import get_cursor
+    with get_cursor() as cur:
+        cur.execute("SELECT email FROM app.users WHERE id = %s", (user["sub"],))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Paystack overwrites callback_url's query string with its own
+    # trxref/reference params on redirect — any query string we pass here
+    # doesn't survive the round trip, so the frontend detects "returned
+    # from checkout" from those Paystack-added params instead.
+    frontend_origin = os.environ.get("FRONTEND_ORIGINS", "http://localhost:5173").split(",")[0]
+    try:
+        data = initialize_transaction(
+            email=row["email"],
+            plan_code=plan_code,
+            amount_subunits=usd_to_paystack_subunits(PLANS[payload.plan]["price_amount"]),
+            callback_url=f"{frontend_origin}/plans",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Paystack checkout initialization failed: {e}")
+    return {"authorization_url": data["authorization_url"]}
+
+
+@app.post("/webhooks/paystack", summary="Paystack subscription event webhook")
+async def paystack_webhook(request: Request):
+    from app.payments import verify_webhook_signature
+    raw_body = await request.body()
+    signature = request.headers.get("x-paystack-signature", "")
+    if not verify_webhook_signature(raw_body, signature):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    event = await request.json()
+    event_type = event.get("event")
+    data = event.get("data", {})
+
+    try:
+        from app.db import get_tenant_id_by_email, set_tenant_subscription
+        from app.payments import PAYSTACK_PLAN_CODES
+        if event_type in ("subscription.create", "charge.success"):
+            email = data.get("customer", {}).get("email")
+            plan_code = data.get("plan", {}).get("plan_code")
+            tenant_id = get_tenant_id_by_email(email) if email else None
+            plan_id = next((p for p, code in PAYSTACK_PLAN_CODES.items() if code == plan_code), None)
+            if tenant_id and plan_id:
+                set_tenant_subscription(
+                    tenant_id, plan_id,
+                    customer_code=data.get("customer", {}).get("customer_code"),
+                    subscription_code=data.get("subscription_code", ""),
+                    status="active",
+                )
+        elif event_type in ("subscription.disable", "subscription.not_renew"):
+            from app.db import get_tenant_row
+            email = data.get("customer", {}).get("email")
+            tenant_id = get_tenant_id_by_email(email) if email else None
+            if tenant_id:
+                # Keep the existing customer/subscription codes on file (for
+                # the billing portal / re-subscribe history) rather than
+                # overwriting them with whatever this event happens to
+                # carry — only the entitlement and status actually change.
+                existing = get_tenant_row(tenant_id) or {}
+                set_tenant_subscription(
+                    tenant_id, DEFAULT_PLAN,
+                    customer_code=existing.get("paystack_customer_code"),
+                    subscription_code=existing.get("paystack_subscription_code"),
+                    status="canceled",
+                )
+    except Exception as e:
+        # Signature already verified — this is a genuine Paystack event.
+        # Log and still return 200 so Paystack doesn't retry-storm us over
+        # a transient DB hiccup; same graceful-degradation style as
+        # ClickHouse logging elsewhere in this file.
+        print(f"[WARNING] Paystack webhook processing failed for event={event_type}: {e}")
+
+    return {"status": "received"}
+
+
+@app.get("/v1/tenant/billing-portal", summary="Get this tenant's Paystack subscription-management link")
+async def billing_portal(user: dict = Depends(get_current_user)):
+    from app.db import get_tenant_row
+    tenant_row = get_tenant_row(user["tenant_id"])
+    subscription_code = tenant_row.get("paystack_subscription_code") if tenant_row else None
+    if not subscription_code:
+        raise HTTPException(
+            status_code=400,
+            detail="No active subscription to manage — switch to a paid plan first.",
+        )
+    from app.payments import get_manage_link
+    try:
+        link = get_manage_link(subscription_code)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Paystack billing-portal request failed: {e}")
+    return {"link": link}
 
 
 @app.get("/v1/predictions/history", summary="This tenant's recent predictions")
@@ -714,7 +897,7 @@ async def admin_tenants(admin_user: dict = Depends(require_admin)):
 
     with get_cursor() as cur:
         cur.execute(
-            "SELECT tenant_id, name, invite_code, created_at FROM app.tenants "
+            "SELECT tenant_id, name, plan, invite_code, created_at FROM app.tenants "
             "ORDER BY created_at DESC"
         )
         tenants = cur.fetchall()
@@ -729,13 +912,15 @@ async def admin_tenants(admin_user: dict = Depends(require_admin)):
             )
             user_count = cur.fetchone()["n"]
         used = int(redis_client.get(f"quota:{t['tenant_id']}:{month}") or 0)
+        plan = t.get("plan") or DEFAULT_PLAN
         result.append({
             "tenant_id":   t["tenant_id"],
             "name":        t["name"],
+            "plan":        plan,
             "created_at":  t["created_at"].isoformat(),
             "user_count":  user_count,
             "quota_used":  used,
-            "quota_limit": MONTHLY_QUOTA_LIMIT,
+            "quota_limit": PLANS.get(plan, PLANS[DEFAULT_PLAN])["monthly_quota"],
         })
     return {"tenants": result}
 
