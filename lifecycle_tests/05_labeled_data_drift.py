@@ -1,13 +1,15 @@
 """
 lifecycle_tests/05_labeled_data_drift.py
 ────────────────────────────────────────────────────────────────────────────
-Stage 5 — LABELED DATA, drift case. Empties the labeled-data MinIO bucket
-(scoping this run's PSI check to exactly this slice), uploads
-labeled_data_drift.csv (deliberately the lowest-Credit_Score rows — engineered
-to blow PSI past 0.2) via /v1/labeled-data, then triggers the real
-selastone_daily_ingestion DAG and confirms it DOES commit: this is the real,
-approved side effect — a genuine git commit authored by the mlops bot,
-closing the loop that the weekly retrain DAG (stage 6) picks up next.
+Stage 5 — LABELED DATA, drift case. Empties the labeled-data MinIO bucket,
+uploads labeled_data_drift.csv (deliberately the lowest-Credit_Score rows —
+engineered to blow PSI past 0.2) via /v1/labeled-data, then triggers the real
+selastone_daily_ingestion DAG and confirms it DOES commit: same unconditional
+collection as stage 4 — the daily DAG doesn't compute PSI at all anymore, it
+commits any slice that clears the row-count minimum. This slice's
+feedback_labeled.csv overwrites stage 4's, and it's what the weekly retrain
+DAG's check_psi_drift gate (stage 6) actually evaluates — PSI against this
+data should read as drifted since it's engineered to be.
 """
 import sys
 import time

@@ -7,7 +7,7 @@ Two workloads are supported:
 - **Real-time scoring** — authenticated REST requests return a default probability in under 300 ms
 - **Bulk batch scoring** — CSV files of any size are queued asynchronously, scored in the background, and made available via a presigned download link
 
-An automated MLOps loop keeps the model current: tenants upload labeled outcomes, a daily job measures data drift, and a weekly pipeline retrains and promotes a new model if the challenger beats the incumbent by a meaningful margin.
+An automated MLOps loop keeps the model current: tenants upload labeled outcomes, a daily job collects them into DVC unconditionally, and a weekly pipeline checks that data for drift, retrains, and promotes a new model if the challenger beats the incumbent by a meaningful margin.
 
 ---
 
@@ -66,7 +66,7 @@ When a batch job completes, the API generates a presigned URL — the tenant dow
 
 ### ClickHouse
 
-Every prediction is written to a `prediction_logs` table in ClickHouse. ClickHouse stores data column by column rather than row by row, which makes range aggregations — "average default probability per tenant across all of last month" — very fast. This suits audit and monitoring queries well. A second table, `labeled_uploads`, records when tenants submit actuals, forming a lightweight chain-of-custody trail.
+Every prediction is written to a `prediction_logs` table in ClickHouse. ClickHouse stores data column by column rather than row by row, which makes range aggregations — "average default probability per tenant across all of last month" — very fast. This suits audit and monitoring queries well. A second table, `labeled_uploads`, records when tenants submit actuals, forming a lightweight chain-of-custody trail. `labeled_uploads` is where ClickHouse logs the event of that upload happening — not necessarily the full row-level data (that lives in MinIO/DVC), but metadata about the submission itself: which tenant submitted, when, how many rows, maybe which file/job it corresponds to.
 
 > **Closed-source alternative:** BigQuery, Snowflake, and Redshift are managed columnar databases that remove the operational overhead of running ClickHouse. Elasticsearch is common for logs but performs poorly on numeric aggregations. A regular Postgres table works at small volumes but degrades as prediction rows accumulate into the millions.
 
@@ -103,7 +103,7 @@ The training script runs headlessly — no plots, no interactive cells, no manua
 
 **The training sequence:**
 
-1. **Load** the DVC-tracked baseline CSV (148,670 rows, 34 columns). If a `feedback_labeled.csv` exists — written by the daily drift DAG when tenant actuals triggered a retraining signal — it is merged in before any splitting.
+1. **Load** the DVC-tracked baseline CSV (148,670 rows, 34 columns). If a `feedback_labeled.csv` exists — written unconditionally by the daily ingestion DAG whenever it collects enough tenant actuals, and only reached here once the weekly DAG's `check_psi_drift` gate has confirmed it actually drifted — it is merged in before any splitting.
 
 2. **Clean** — drop high-missing columns, impute numeric columns with medians, encode categoricals as integers with `LabelEncoder`.
 
@@ -149,7 +149,7 @@ PSI < 0.10   →  stable, no action
 
 The calculation splits both distributions into histogram buckets and compares the percentage of values in each bucket. A small epsilon prevents division-by-zero when a bucket is empty in one of the distributions.
 
-PSI is computed across seven key numeric features: `loan_amount`, `property_value`, `income`, `Credit_Score`, `LTV`, `dtir1`, `term`. If any one of them crosses 0.2, the daily ingestion DAG marks the data as needing a retraining run.
+PSI is computed across seven key numeric features: `loan_amount`, `property_value`, `income`, `Credit_Score`, `LTV`, `dtir1`, `term`. If any one of them crosses 0.2, `check_psi_drift` in the weekly retrain DAG lets training proceed for that run.
 
 **Why PSI over a statistical test like KS or chi-squared?**
 
@@ -214,7 +214,7 @@ Every request must include `Authorization: Bearer <token>`. `verify_token()` acc
 
 ### Labeled data — `POST /v1/labeled-data`
 
-Tenants upload CSVs with actual loan outcomes (`actual_outcome`: 0 or 1). These land in MinIO `labeled-data/` and feed the daily drift check. Requiring an outcome column at upload time enforces data quality before it enters the pipeline.
+Tenants upload CSVs with actual loan outcomes (`actual_outcome`: 0 or 1). These land in MinIO `labeled-data/` and feed the daily ingestion DAG's unconditional DVC collection, which the weekly retrain DAG's drift check then evaluates. Requiring an outcome column at upload time enforces data quality before it enters the pipeline.
 
 ### Model hot-swap — `app/model_manager.py`
 
@@ -260,22 +260,22 @@ Two DAGs automate the model lifecycle. Tasks within a DAG pass data to each othe
 ### Daily ingestion DAG (`selastone_daily_ingestion`, 01:00 UTC)
 
 ```
-pull_labeled_data → check_psi_drift → commit_to_dvc
+pull_labeled_data → commit_to_dvc
 ```
 
 **`pull_labeled_data`** downloads every CSV from MinIO `labeled-data`, concatenates them, and saves a combined file. It passes the row count downstream via XCom.
 
-**`check_psi_drift`** loads the DVC-tracked baseline CSV and the combined labeled pull, then runs PSI across seven numeric features. If fewer than 100 labeled rows are available the task exits early — PSI on tiny samples is statistically meaningless.
-
-**`commit_to_dvc`** only executes when drift ≥ 0.2. It saves the merged labeled data to `notebooks/archive/feedback_labeled.csv`, runs `dvc add` and `dvc push` to upload the file to MinIO, and commits the `.dvc` pointer to git. This pointer is what the weekly retrain DAG pulls down to include the new data.
+**`commit_to_dvc`** collects unconditionally — it saves the merged labeled data to `notebooks/archive/feedback_labeled.csv` whenever at least 100 labeled rows are available (fewer than that and the task exits early — DVC-tracking a tiny sample isn't worth a commit), then runs `dvc add` and `dvc push` to upload the file to MinIO and commits the `.dvc` pointer to git. This DAG no longer computes PSI at all — it just makes sure every day's tenant actuals reach DVC so the weekly DAG always has the latest data to check. This pointer is what the weekly retrain DAG pulls down.
 
 ### Weekly retraining DAG (`selastone_weekly_retrain`, Monday 02:00 UTC)
 
 ```
-sync_data → train_model → promote_model
+sync_data → check_psi_drift → train_model → promote_model
 ```
 
 **`sync_data`** runs `git pull` followed by `dvc pull` to fetch any new `.dvc` pointer files and download the corresponding data from MinIO. This is how the labeled feedback from the daily DAG enters the training run.
+
+**`check_psi_drift`** is a `ShortCircuitOperator` gatekeeper — it loads the DVC-tracked baseline CSV and whatever `feedback_labeled.csv` `sync_data` just pulled, runs PSI across seven numeric features, and only lets `train_model`/`promote_model` proceed when PSI ≥ 0.2. Moving the check here (instead of gating the daily commit on it) means a slow drift building up over several days of small, individually-sub-threshold daily commits is still caught — the daily DAG no longer discards data just because a single day's slice didn't look drifted, and this task always evaluates against the same DVC-committed baseline used to train. If `feedback_labeled.csv` doesn't exist yet (no day has cleared the 100-row minimum) the gate short-circuits and skips retraining, so a week with no meaningful new data burns no training compute.
 
 **`train_model`** calls `notebooks/retrain.py`. All four candidate models are trained and logged to MLflow.
 
@@ -304,7 +304,7 @@ The API exposes a `/metrics` endpoint that Prometheus scrapes every 15 seconds. 
 | `batch_uploads_total`        | `tenant_id`, `status`     | Upload outcomes (success / invalid / quota_exceeded / minio_error) |
 | `batch_rows_total`           | `tenant_id`               | Total rows processed per tenant per month                          |
 
-Grafana dashboards show these alongside PSI drift scores queried from ClickHouse. A rising PSI trend on the dashboard is an early warning before the formal 0.2 threshold triggers retraining — it gives operators time to investigate whether drift reflects a genuine distribution shift or a data quality issue upstream.
+Grafana dashboards show these alongside PSI drift scores queried from ClickHouse. A rising PSI trend on the dashboard is an early warning before the formal 0.2 threshold trips the weekly retrain DAG's `check_psi_drift` gate — it gives operators time to investigate whether drift reflects a genuine distribution shift or a data quality issue upstream.
 
 > **Closed-source alternative:** Datadog, New Relic, and Dynatrace provide full-stack observability with managed infrastructure and alerting. For ML-specific monitoring, Arize AI and Fiddler monitor prediction distributions and model performance degradation with less setup than building custom dashboards.
 
@@ -319,10 +319,10 @@ Grafana dashboards show these alongside PSI drift scores queried from ClickHouse
 | `train_slice.csv` | 100,000 | Training a holdout-clean baseline champion |
 | `single_predict_holdout.csv` | 25 | `POST /v1/predict`, one row at a time |
 | `bulk_predict_holdout.csv` + answer key | 2,000 | `POST /v1/batch/upload` |
-| `labeled_data_drift.csv` | 1,500 | `POST /v1/labeled-data` — engineered low-Credit_Score rows, deliberately over the PSI 0.2 threshold |
-| `labeled_data_stable.csv` | 1,500 | `POST /v1/labeled-data` — plain random sample, negative control |
+| `labeled_data_drift.csv` | 1,500 | `POST /v1/labeled-data` — engineered low-Credit_Score rows, deliberately over the PSI 0.2 threshold checked by the weekly DAG's gate |
+| `labeled_data_stable.csv` | 1,500 | `POST /v1/labeled-data` — plain random sample, negative control for the weekly DAG's drift gate |
 
-`lifecycle_tests/` (separate from `tests/`) drives the real, running stack through all five stages using these slices — not mocked: real MLflow promotions, a real restart of `celery_worker` to pick up a freshly trained model, and real Airflow DAG triggers (including the daily DAG's real `git`/`dvc` commit when drift is detected). Each numbered script is independently runnable and checks its own prerequisites; `run_all.sh` chains all seven in order. See `lifecycle_tests/README.md` for the full stage breakdown and known constraints (the 1,000-row/month tenant quota caps how much of `bulk_predict_holdout.csv` a single request can use, for one).
+`lifecycle_tests/` (separate from `tests/`) drives the real, running stack through all five stages using these slices — not mocked: real MLflow promotions, a real restart of `celery_worker` to pick up a freshly trained model, and real Airflow DAG triggers (including the daily DAG's real, unconditional `git`/`dvc` commit, and the weekly DAG's real drift-gated retrain). Each numbered script is independently runnable and checks its own prerequisites; `run_all.sh` chains all seven in order. See `lifecycle_tests/README.md` for the full stage breakdown and known constraints (the 1,000-row/month tenant quota caps how much of `bulk_predict_holdout.csv` a single request can use, for one).
 
 This exercise is what surfaced several bugs invisible to mocked unit tests: `ModelManager` never actually serving a promoted model to `/v1/predict` ([Prediction API](#6-prediction-api)), a raw-vs-hyphenated feature name mismatch that silently dropped `co-applicant_credit_type` on every real-time prediction, a quota check that charged tenants for requests it then rejected, and `promote_if_better()` passing arguments in the wrong order to `create_model_version` — which would have crashed the very first time a challenger actually earned promotion.
 
@@ -463,8 +463,8 @@ python -m pytest tests/integration/ -v
 │   ├── celery_app.py        # Celery config — Redis db/2 broker, db/3 backend
 │   └── tasks.py             # process_batch: MinIO read → score → MinIO write → Redis status
 ├── airflow_dags/
-│   ├── ingestion.py         # Daily DAG: pull labeled CSVs → PSI check → DVC commit
-│   ├── weekly_retrain.py    # Weekly DAG: git pull → retrain → promote
+│   ├── ingestion.py         # Daily DAG: pull labeled CSVs → unconditional DVC commit
+│   ├── weekly_retrain.py    # Weekly DAG: git pull → PSI gate → retrain → promote
 │   └── promotion.py         # promote_if_better(): 2% AUC gate before Production swap
 ├── notebooks/
 │   ├── retrain.py           # Headless training: 4 models → MLflow logging → artefact save

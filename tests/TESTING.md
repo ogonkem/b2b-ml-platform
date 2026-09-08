@@ -77,8 +77,11 @@ skipping, custom thresholds, edge cases (constant arrays, no shared columns).
 ```
 pytest tests/unit/test_weekly_retrain_dag.py -v
 ```
-Tests DAG structure: 3 tasks, sync_data → train_model → promote_model order,
-Monday 02:00 schedule, catchup=False.
+Tests DAG structure: 4 tasks, sync_data → check_psi_drift → train_model →
+promote_model order, Monday 02:00 schedule, catchup=False, and
+check_psi_drift's own logic — sample/baseline missing guards, drift
+detection, and that it's wired as a ShortCircuitOperator so a non-drifted
+week skips train_model/promote_model entirely.
 
 ### 11. Model promotion logic
 ```
@@ -91,10 +94,12 @@ Tests promote_if_better — threshold gate (>=2% AUC improvement), edge cases
 ```
 pytest tests/unit/test_ingestion_dag.py -v
 ```
-Tests DAG structure and all three task functions — pull_labeled_data (MinIO
-listing and concatenation), check_psi_drift (sample count guard, baseline
-missing guard, drift detection), commit_to_dvc (subprocess sequencing, column
-rename, skip when no drift).
+Tests DAG structure (2 tasks: pull_labeled_data → commit_to_dvc) and both
+task functions — pull_labeled_data (MinIO listing and concatenation),
+commit_to_dvc (subprocess sequencing, column rename, skip below the
+MIN_SAMPLES row-count floor). PSI drift is no longer computed in this DAG —
+see test_weekly_retrain_dag.py's TestCheckPSIDrift for that, now the
+weekly DAG's gatekeeper.
 
 ---
 

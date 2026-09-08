@@ -6,16 +6,19 @@ Daily DAG that runs at 01:00 UTC (one hour before the Monday retrain at 02:00).
 Tasks:
   t1  pull_labeled_data   — downloads all CSVs from MinIO labeled-data bucket
                             uploaded by the business via POST /v1/labeled-data
-  t2  check_psi_drift     — computes Population Stability Index against the
-                            current DVC-tracked training baseline
-  t3  commit_to_dvc       — only runs when drift >= 0.2 AND >= 100 labeled rows;
-                            saves merged CSV to notebooks/archive/feedback_labeled.csv,
-                            dvc add + dvc push, git commit the .dvc pointer
+  t2  commit_to_dvc       — unconditionally saves the merged CSV to
+                            notebooks/archive/feedback_labeled.csv whenever
+                            >= MIN_SAMPLES labeled rows are available, then
+                            dvc add + dvc push, git commit the .dvc pointer.
+                            PSI drift is no longer computed here — the weekly
+                            retrain DAG computes it against whatever this task
+                            last committed and gates training on it.
 
-The weekly_retrain DAG (Monday 02:00) then picks up the updated DVC data.
+The weekly_retrain DAG (Monday 02:00) then picks up the updated DVC data and
+decides whether the drift it sees is worth retraining over.
 """
 
-import sys, os, subprocess, json
+import sys, os, subprocess
 import pandas as pd
 from io import BytesIO
 from pathlib import Path
@@ -26,14 +29,10 @@ from airflow.operators.python import PythonOperator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from shared.drift import check_drift
-
 # ── Constants ─────────────────────────────────────────────────────────────────
-PSI_THRESHOLD  = 0.2
-MIN_SAMPLES    = 100
-FEEDBACK_CSV   = Path("notebooks/archive/feedback_labeled.csv")
-BASELINE_CSV   = Path("notebooks/archive/Loan_Default.csv")
-MINIO_BUCKET   = "labeled-data"
+MIN_SAMPLES  = 100
+FEEDBACK_CSV = Path("notebooks/archive/feedback_labeled.csv")
+MINIO_BUCKET = "labeled-data"
 
 default_args = {
     "retries":     1,
@@ -98,54 +97,20 @@ def pull_labeled_data(**context):
     context["ti"].xcom_push(key="labeled_path", value=tmp_path)
 
 
-def check_psi_drift(**context):
+def commit_to_dvc(**context):
     """
-    Loads the labeled pull and the DVC-tracked training CSV, then computes PSI
-    on key numeric features.  Pushes drift_detected (bool) and drift_report
-    (dict) via XCom.  Skips if fewer than MIN_SAMPLES rows are available.
+    Saves labeled data to a DVC-tracked CSV and commits the pointer file to git.
+    Runs unconditionally whenever >= MIN_SAMPLES rows were pulled — drift is no
+    longer a gate here, it's computed downstream in selastone_weekly_retrain.
     """
     ti        = context["ti"]
     n_samples = ti.xcom_pull(task_ids="pull_labeled_data", key="n_samples")
 
     if not n_samples or n_samples < MIN_SAMPLES:
-        print(f"Only {n_samples} labeled rows — need {MIN_SAMPLES}. Skipping PSI check.")
-        ti.xcom_push(key="drift_detected", value=False)
+        print(f"Only {n_samples} labeled rows — need {MIN_SAMPLES}. DVC commit skipped.")
         return
 
     labeled_path = ti.xcom_pull(task_ids="pull_labeled_data", key="labeled_path")
-    incoming_df  = pd.read_csv(labeled_path)
-
-    if not BASELINE_CSV.exists():
-        print(f"Baseline CSV not found at {BASELINE_CSV} — skipping PSI check.")
-        ti.xcom_push(key="drift_detected", value=False)
-        return
-
-    baseline_df = pd.read_csv(BASELINE_CSV)
-    result      = check_drift(baseline_df, incoming_df)
-
-    print(f"PSI result: max_psi={result['max_psi']:.4f}, drifted={result['drifted']}")
-    for col, psi in result["psi_per_col"].items():
-        print(f"  {col:<25} PSI={psi:.4f}")
-
-    ti.xcom_push(key="drift_detected", value=result["drifted"])
-    ti.xcom_push(key="drift_report",   value=result)
-
-
-def commit_to_dvc(**context):
-    """
-    Saves labeled data to a DVC-tracked CSV and commits the pointer file to git.
-    Only executes when drift was detected in check_psi_drift.
-    The weekly_retrain DAG picks up the updated DVC data on its next run.
-    """
-    ti             = context["ti"]
-    drift_detected = ti.xcom_pull(task_ids="check_psi_drift", key="drift_detected")
-
-    if not drift_detected:
-        print("No drift detected — DVC commit skipped.")
-        return
-
-    labeled_path = ti.xcom_pull(task_ids="pull_labeled_data", key="labeled_path")
-    drift_report = ti.xcom_pull(task_ids="check_psi_drift",   key="drift_report")
     labeled_df   = pd.read_csv(labeled_path)
 
     # Normalise target column name to match training CSV
@@ -165,10 +130,10 @@ def commit_to_dvc(**context):
     subprocess.run(["git", "add", dvc_pointer], check=True)
     subprocess.run([
         "git", "commit", "-m",
-        f"data: labeled feedback — PSI={drift_report['max_psi']:.3f} drift detected",
+        f"data: labeled feedback — {len(labeled_df)} rows collected",
     ], check=True)
 
-    print(f"DVC commit complete: {drift_report}")
+    print("DVC commit complete.")
 
 
 # ── DAG definition ─────────────────────────────────────────────────────────────
@@ -181,7 +146,6 @@ with DAG(
 ) as dag:
 
     t1 = PythonOperator(task_id="pull_labeled_data", python_callable=pull_labeled_data)
-    t2 = PythonOperator(task_id="check_psi_drift",   python_callable=check_psi_drift)
-    t3 = PythonOperator(task_id="commit_to_dvc",     python_callable=commit_to_dvc)
+    t2 = PythonOperator(task_id="commit_to_dvc",     python_callable=commit_to_dvc)
 
-    t1 >> t2 >> t3
+    t1 >> t2

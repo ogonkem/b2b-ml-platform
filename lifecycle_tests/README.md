@@ -54,15 +54,23 @@ bash lifecycle_tests/run_all.sh
    `bulk_predict_holdout.csv` to `/v1/batch/upload` (a single request can't
    exceed the 1,000-row/month tenant quota — see Known constraints below),
    scores the downloaded results.
-4. **Labeled data — stable** (negative control) — uploads
-   `labeled_data_stable.csv`, triggers the real `selastone_daily_ingestion`
-   DAG, confirms it does *not* commit.
+4. **Labeled data — stable** — uploads `labeled_data_stable.csv`, triggers
+   the real `selastone_daily_ingestion` DAG, confirms it *does* commit. The
+   daily DAG collects unconditionally now (no PSI check at this stage), so
+   "stable" data is committed to DVC exactly like drifted data — this stage
+   demonstrates that, not a drift signal.
 5. **Labeled data — drift** — uploads `labeled_data_drift.csv` (engineered
    low-Credit_Score rows), triggers the same DAG, confirms it *does* commit
-   for real (author: `selastone-mlops-bot`).
+   for real (author: `selastone-mlops-bot`), overwriting stage 4's commit.
 6. **Weekly retrain** — triggers the real `selastone_weekly_retrain` DAG
-   (`sync_data -> train_model -> promote_model`), reads back both MLflow
-   runs, reports whether the real 2pp-AUC gate promoted a challenger.
+   (`sync_data -> check_psi_drift -> train_model -> promote_model`), reads
+   back both MLflow runs, reports whether the real 2pp-AUC gate promoted a
+   challenger. `check_psi_drift` is the gatekeeper moved here from the old
+   daily DAG — it evaluates PSI against stage 5's (drifted) commit, so the
+   gate should pass and training should proceed. Because stage 5 always runs
+   right before this one, the sequence never exercises the gate's
+   negative-control path (skipping retrain on non-drifted data) — only that
+   it correctly proceeds on drifted data.
 7. **Verify hotswap** — confirms `/health` and live `/v1/predict` calls agree
    on whatever stage 6 concluded — re-validates the `ModelManager` hot-swap
    path.
@@ -75,20 +83,21 @@ bash lifecycle_tests/run_all.sh
   once the token's monthly total passes 1,000 — reset with
   `docker exec data-redis redis-cli DEL "quota:<token>:<YYYY_MM>"` for local
   testing (matches whatever `API_TOKENS`'s first token is in `.env`).
-- **Stage 5 makes a real git commit** on whatever branch is checked out,
-  authored by `selastone-mlops-bot <mlops-bot@selastone.local>` — this is
-  the intended, approved behavior, not a bug.
+- **Stages 4 and 5 each make a real git commit** on whatever branch is
+  checked out, authored by `selastone-mlops-bot <mlops-bot@selastone.local>`
+  — collection is unconditional now, so both the stable and drift slices
+  commit; this is the intended, approved behavior, not a bug.
 - **Stage 6 can take several minutes** — `train_model` runs the full
   `notebooks/retrain.py` (4 models, SMOTE, tuned hyperparameters) inside the
   Airflow container against the full baseline + merged feedback data.
 - Re-running stage 4/5 clears the `labeled-data` MinIO bucket first — local
   dev only, don't point this at anything with real tenant data in it.
-- **Re-running the full suite twice in a row can fail stage 5** with `git
-  commit` returning exit 1 ("nothing to commit") — `labeled_data_drift.csv`
-  is a static fixture, so a second run produces a byte-identical
-  `feedback_labeled.csv`/`.dvc` pointer to the one already committed, and
-  there's genuinely nothing new to commit. Expected git behavior, not a bug;
-  in real operation each day's labeled data differs. If you need a fully
-  clean re-run, `git rm notebooks/archive/feedback_labeled.csv.dvc` (or just
-  accept stage 1 will train on the previously-committed feedback too — it
-  merges unconditionally, same as the real weekly DAG).
+- Since stage 4 now always commits stable content right before stage 5
+  overwrites it with drift content, consecutive full-suite runs no longer hit
+  the old "nothing to commit" `git commit` failure on stage 5 that a
+  drift-gated daily commit used to produce (stage 4's intervening commit
+  means stage 5's content is never byte-identical to the last commit). If you
+  still want a fully clean re-run, `git rm
+  notebooks/archive/feedback_labeled.csv.dvc` (or just accept stage 1 will
+  train on the previously-committed feedback too — it merges unconditionally,
+  same as the real weekly DAG).

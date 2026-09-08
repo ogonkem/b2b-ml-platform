@@ -2,13 +2,22 @@
 lifecycle_tests/06_weekly_retrain.py
 ────────────────────────────────────────────────────────────────────────────
 Stage 6 — WEEKLY RETRAIN. Triggers the real selastone_weekly_retrain DAG
-(sync_data -> train_model -> promote_model) and lets it run to completion
-inside the now-fixed Airflow container. train_model calls notebooks/retrain.py
-with no TRAINING_DATA_PATH override, so it trains on the full baseline CSV
-merged with the feedback_labeled.csv stage 5 just committed — matching real
-weekly-DAG behavior. promote_model then runs the actual, governed
-2-run/2pp-AUC promotion gate (airflow_dags/promotion.py) comparing this
-challenger against stage 1's baseline run — for real, not simulated.
+(sync_data -> check_psi_drift -> train_model -> promote_model) and lets it run
+to completion inside the now-fixed Airflow container. check_psi_drift is the
+gatekeeper moved here from the old daily DAG: it computes PSI against the
+feedback_labeled.csv stage 5 just committed (engineered to drift), so the gate
+should pass and let training proceed — this stage's success therefore also
+proves the gate works, not just that training/promotion do. train_model calls
+notebooks/retrain.py with no TRAINING_DATA_PATH override, so it trains on the
+full baseline CSV merged with that feedback data, matching real weekly-DAG
+behavior. promote_model then runs the actual, governed 2-run/2pp-AUC
+promotion gate (airflow_dags/promotion.py) comparing this challenger against
+stage 1's baseline run — for real, not simulated.
+
+Note: because stage 4's stable-data commit is immediately overwritten by
+stage 5's drift-data commit before this stage runs, this sequence never
+actually exercises the gate's negative-control path (short-circuiting on
+non-drifted data) — only that it correctly lets drifted data through.
 """
 import sys
 import time

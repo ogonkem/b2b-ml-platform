@@ -1,12 +1,16 @@
 """
 lifecycle_tests/04_labeled_data_stable.py
 ────────────────────────────────────────────────────────────────────────────
-Stage 4 — LABELED DATA, negative control. Empties the labeled-data MinIO
-bucket (local-dev only — keeps this run's PSI check scoped to exactly this
-slice), uploads labeled_data_stable.csv (a plain random sample — no engineered
-drift) via /v1/labeled-data, then triggers the real selastone_daily_ingestion
-DAG and confirms it does NOT commit anything: the daily DAG must not
-false-trigger a retraining signal on ordinary data.
+Stage 4 — LABELED DATA, stable case. Empties the labeled-data MinIO bucket
+(local-dev only), uploads labeled_data_stable.csv (a plain random sample — no
+engineered drift) via /v1/labeled-data, then triggers the real
+selastone_daily_ingestion DAG and confirms it DOES commit: the daily DAG
+collects unconditionally now — PSI is no longer computed here at all, so
+"stable" data is committed to DVC exactly like drifted data would be. The
+negative control for drift now lives in stage 6's check_psi_drift gate: this
+stage's commit becomes the feedback_labeled.csv that stage 5 immediately
+overwrites, so stage 6 never actually sees this stable slice — it only
+demonstrates that collection itself doesn't care about drift.
 """
 import sys
 import time
@@ -43,7 +47,7 @@ def git_head():
 
 
 def main():
-    banner("STAGE 4 — LABELED DATA (stable, negative control)")
+    banner("STAGE 4 — LABELED DATA (stable, unconditional collection)")
     require_holdout_files(STABLE_FILE)
     require_api_reachable()
 
@@ -65,10 +69,10 @@ def main():
 
     head_after = git_head()
     require(
-        head_after == head_before,
-        f"expected no git commit (negative control) but HEAD moved {head_before[:8]} -> {head_after[:8]}",
+        head_after != head_before,
+        f"expected a real commit from unconditional collection but HEAD did not move ({head_before[:8]})",
     )
-    print(f"  HEAD unchanged ({head_after[:8]}) — no false-triggered commit")
+    print(f"  HEAD moved {head_before[:8]} -> {head_after[:8]} — stable data committed regardless of drift")
     print("\n[OK] Stage 4 complete.")
 
 
