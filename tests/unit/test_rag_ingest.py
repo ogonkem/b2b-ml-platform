@@ -1,6 +1,6 @@
 """
 tests/unit/test_rag_ingest.py
-Tests for rag_harness/ingest_task.py.
+Tests for rag_service/ingest_task.py.
 
 Two layers, matching this project's convention of testing pure logic
 directly and mocking every external service:
@@ -8,7 +8,7 @@ directly and mocking every external service:
     policy docs (tests/fixtures/policy_docs/) — no mocking needed, since
     none of it touches MinIO, Postgres, or the network.
   - The full ingest_document task is run with MinIO, Postgres (via
-    rag_harness.db.get_cursor), and the OpenAI embedding call all mocked —
+    rag_service.db.get_cursor), and the OpenAI embedding call all mocked —
     same style as tests/unit/test_celery_tasks.py's process_batch tests.
 """
 import base64
@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import pytest
 
-from rag_harness.ingest_task import (
+from rag_service.ingest_task import (
     Chunk,
     _enforce_token_bounds,
     _extract_ext,
@@ -283,11 +283,11 @@ def _run_ingest(cursor, minio, filename, text, tenant_id="tenant-a", doc_id="doc
             embed_calls.append(list(texts))
         return [[0.1] * 1536 for _ in texts]
 
-    with patch("rag_harness.ingest_task._minio", return_value=minio), \
-         patch("rag_harness.ingest_task.get_cursor", _fake_get_cursor(cursor)), \
-         patch("rag_harness.ingest_task._embed_batch", side_effect=fake_embed), \
-         patch("rag_harness.ingest_task._redis", return_value=fake_redis or MagicMock()):
-        from rag_harness.ingest_task import ingest_document
+    with patch("rag_service.ingest_task._minio", return_value=minio), \
+         patch("rag_service.ingest_task.get_cursor", _fake_get_cursor(cursor)), \
+         patch("rag_service.ingest_task._embed_batch", side_effect=fake_embed), \
+         patch("rag_service.ingest_task._redis", return_value=fake_redis or MagicMock()):
+        from rag_service.ingest_task import ingest_document
         return ingest_document.run(tenant_id, doc_id, filename, _b64(text))
 
 
@@ -417,20 +417,20 @@ class TestIngestStatusTracking:
         assert "csv" in error_calls[0].args[1].lower() or "unsupported" in error_calls[0].args[1].lower()
 
     def test_get_ingest_status_reports_unknown_when_nothing_recorded(self):
-        from rag_harness.ingest_task import get_ingest_status
+        from rag_service.ingest_task import get_ingest_status
         fake_redis = MagicMock()
         fake_redis.get.return_value = None
-        with patch("rag_harness.ingest_task._redis", return_value=fake_redis):
+        with patch("rag_service.ingest_task._redis", return_value=fake_redis):
             result = get_ingest_status("never-enqueued")
         assert result == {"status": "unknown", "error": None}
 
     def test_get_ingest_status_reports_recorded_status_and_error(self):
-        from rag_harness.ingest_task import get_ingest_status
+        from rag_service.ingest_task import get_ingest_status
         fake_redis = MagicMock()
         fake_redis.get.side_effect = lambda key: (
             "failed" if key == "ingest_status:doc-9" else
             "boom" if key == "ingest_status:doc-9:error" else None
         )
-        with patch("rag_harness.ingest_task._redis", return_value=fake_redis):
+        with patch("rag_service.ingest_task._redis", return_value=fake_redis):
             result = get_ingest_status("doc-9")
         assert result == {"status": "failed", "error": "boom"}

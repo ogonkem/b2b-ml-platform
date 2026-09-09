@@ -2,19 +2,19 @@
 rule_engine/main.py
 Thin FastAPI wrapper around rule_engine/engine.py's pure decision logic.
 
-Deliberately its own service rather than an endpoint inside rag_harness's
+Deliberately its own service rather than an endpoint inside rag_service's
 FastAPI app, even though the two would share nothing but the auth import:
 this is an audit-critical, must-be-deterministic code path with genuinely
 zero I/O dependencies of its own (no DB, no object storage, no queue, no
 LLM/embedding calls) — see rule_engine/engine.py's module docstring.
-Bundling it into rag_harness would make its availability depend on
+Bundling it into rag_service would make its availability depend on
 Postgres/MinIO/Redis/Celery/OpenAI all being healthy, none of which this
 endpoint actually needs. The cost of that isolation is operational, not
 architectural: one more container, port, and Dockerfile to run
 (Dockerfile.rule_engine, requirements-rule-engine.txt) versus zero extra
-infrastructure if it had lived inside rag_harness.
+infrastructure if it had lived inside rag_service.
 
-Auth reuses app.auth.verify_token directly, same as rag_harness — a bearer
+Auth reuses app.auth.verify_token directly, same as rag_service — a bearer
 value that already authenticates against Selastone's API resolves to the
 same tenant_id here with zero extra setup.
 """
@@ -45,7 +45,7 @@ class DecideRequest(BaseModel):
         default=False,
         description="Bypass tenant-specific thresholds and use the generic, "
                     "risk-score-only fallback bands (see rule_engine/thresholds.py's "
-                    "FALLBACK_RISK_BANDS) — set by agent/graph.py when rag_harness "
+                    "FALLBACK_RISK_BANDS) — set by agent/graph.py when rag_service "
                     "found no policy documents for this tenant.",
     )
 
@@ -69,7 +69,7 @@ async def decide_endpoint(
     token: Optional[HTTPAuthorizationCredentials] = Security(security_scheme),
 ):
     tenant = verify_token(token)
-    # Same convention as rag_harness's /v1/retrieve: tenant_id comes from
+    # Same convention as rag_service's /v1/retrieve: tenant_id comes from
     # the authenticated token, the body's copy is only ever checked against
     # it, never used as the actual identity for the decision.
     if payload.tenant_id != tenant:

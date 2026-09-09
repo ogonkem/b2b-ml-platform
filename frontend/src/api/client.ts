@@ -1,9 +1,9 @@
 const BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
-// agent/ and rag_harness/ are separate services/deployments — each gets its
+// agent/ and rag_service/ are separate services/deployments — each gets its
 // own browser-facing base URL, same VITE_*_BASE_URL-baked-at-build-time
 // pattern as VITE_API_BASE_URL.
 export const AGENT_BASE_URL = import.meta.env.VITE_AGENT_BASE_URL || "http://localhost:8003";
-export const RAG_HARNESS_BASE_URL = import.meta.env.VITE_RAG_HARNESS_BASE_URL || "http://localhost:8001";
+export const RAG_SERVICE_BASE_URL = import.meta.env.VITE_RAG_SERVICE_BASE_URL || "http://localhost:8001";
 
 export class ApiError extends Error {
   status: number;

@@ -2,7 +2,7 @@
 #
 # Additionally requires a real OPENAI_API_KEY in .env — every test in this
 # file does real ingestion and/or real retrieval, both of which call
-# OpenAI to embed text (see rag_harness/ingest_task.py's module docstring
+# OpenAI to embed text (see rag_service/ingest_task.py's module docstring
 # for the tradeoff). Without a real key, every test here is skipped rather
 # than failing — this is a genuine external-credential gate, not a bug.
 #
@@ -26,11 +26,11 @@ _env = dotenv_values(Path(__file__).resolve().parent.parent.parent / ".env")
 OPENAI_API_KEY = _env.get("OPENAI_API_KEY", "")
 pytestmark = pytest.mark.skipif(
     not OPENAI_API_KEY,
-    reason="requires a real OPENAI_API_KEY in .env — rag_harness embeds every "
+    reason="requires a real OPENAI_API_KEY in .env — rag_service embeds every "
            "ingested chunk and every retrieval query via OpenAI",
 )
 
-RAG_HARNESS_URL = "http://localhost:8001"
+RAG_SERVICE_URL = "http://localhost:8001"
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "policy_docs"
 
@@ -91,7 +91,7 @@ def _wait_for_ingest_complete(doc_id: str, tenant: str, timeout: float = 60.0) -
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
-        resp = httpx.get(f"{RAG_HARNESS_URL}/v1/documents/status/{doc_id}", headers=headers, timeout=10.0)
+        resp = httpx.get(f"{RAG_SERVICE_URL}/v1/documents/status/{doc_id}", headers=headers, timeout=10.0)
         resp.raise_for_status()
         last = resp.json()
         if last["status"] in ("complete", "failed"):
@@ -104,7 +104,7 @@ def _ingest(tenant: str, filename: str) -> dict:
     headers = {"Authorization": f"Bearer {tenant}"}
     content = (FIXTURES_DIR / filename).read_bytes()
     resp = httpx.post(
-        f"{RAG_HARNESS_URL}/v1/documents",
+        f"{RAG_SERVICE_URL}/v1/documents",
         headers=headers,
         files={"file": (filename, content, "text/markdown")},
         timeout=30.0,
@@ -162,7 +162,7 @@ def test_ingest_raw_file_lands_in_minio_at_expected_path(ingested_docs):
 def test_retrieve_returns_relevant_top_result_per_tenant(ingested_docs):
     for tenant in TENANT_DOCS:
         resp = httpx.post(
-            f"{RAG_HARNESS_URL}/v1/retrieve",
+            f"{RAG_SERVICE_URL}/v1/retrieve",
             headers={"Authorization": f"Bearer {tenant}"},
             json={"tenant_id": tenant, "query": RELEVANT_QUERY[tenant], "top_k": 3},
             timeout=30.0,
@@ -196,7 +196,7 @@ def test_cross_tenant_isolation_even_when_other_tenant_is_the_closer_match(inges
     mentions mobile money or automated scoring at all. Zero of its chunks
     may appear regardless."""
     resp = httpx.post(
-        f"{RAG_HARNESS_URL}/v1/retrieve",
+        f"{RAG_SERVICE_URL}/v1/retrieve",
         headers={"Authorization": "Bearer microfinance_sacco"},
         json={"tenant_id": "microfinance_sacco", "query": RELEVANT_QUERY["informal_digital_lender"], "top_k": 10},
         timeout=30.0,
@@ -234,7 +234,7 @@ def test_retrieval_quota_exceeded_returns_429_with_matching_ttl():
     r.set(key, 49, ex=60 * 60 * 24 * 32)
 
     ok = httpx.post(
-        f"{RAG_HARNESS_URL}/v1/retrieve",
+        f"{RAG_SERVICE_URL}/v1/retrieve",
         headers=headers,
         json={"tenant_id": QUOTA_TENANT, "query": "anything"},
         timeout=30.0,
@@ -242,7 +242,7 @@ def test_retrieval_quota_exceeded_returns_429_with_matching_ttl():
     assert ok.status_code == 200, ok.text   # the 50th call — exactly at the limit, still allowed
 
     exceeded = httpx.post(
-        f"{RAG_HARNESS_URL}/v1/retrieve",
+        f"{RAG_SERVICE_URL}/v1/retrieve",
         headers=headers,
         json={"tenant_id": QUOTA_TENANT, "query": "anything"},
         timeout=30.0,

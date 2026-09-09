@@ -6,7 +6,7 @@ exhaustively in tests/unit/test_rule_engine.py; this file only confirms the
 FastAPI wrapper calls it correctly and translates its errors properly. No
 external services to mock — rule_engine has none — beyond auth, which is
 exercised for real via app.auth.verify_token (same approach as
-tests/unit/test_rag_retrieve.py for rag_harness).
+tests/unit/test_rag_retrieve.py for rag_service).
 """
 import sys
 from pathlib import Path

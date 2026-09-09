@@ -1,5 +1,5 @@
 """
-rag_harness/ingest_task.py
+rag_service/ingest_task.py
 Celery task for the RAG document-ingestion pipeline. Registered on the same
 Celery app as celery_worker/tasks.py (same Redis broker/backend — see
 celery_worker/celery_app.py's `include` list) rather than a separate Celery
@@ -49,7 +49,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from celery_worker.celery_app import celery_app
-from rag_harness.db import get_cursor
+from rag_service.db import get_cursor
 
 DOC_CHUNKS_BUCKET = "doc-chunks-raw"
 _SUPPORTED_EXTS   = ("pdf", "docx", "md", "txt")

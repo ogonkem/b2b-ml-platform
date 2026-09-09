@@ -422,7 +422,7 @@ def test_calls_do_not_share_or_mutate_state_across_invocations():
 
 
 # ── Fallback mode (use_fallback=True) ──────────────────────────────────────────
-# Used by agent/graph.py when rag_harness's /v1/retrieve found no policy
+# Used by agent/graph.py when rag_service's /v1/retrieve found no policy
 # documents for the tenant — bypasses tenant-specific config entirely.
 
 FALLBACK_BAND_CASES = [

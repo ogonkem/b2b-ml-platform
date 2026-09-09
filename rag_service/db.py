@@ -1,5 +1,5 @@
 """
-rag_harness/db.py
+rag_service/db.py
 Thin psycopg2 layer for the `rag` schema — no ORM, matching app/db.py's
 style and this project's existing convention of thin clients everywhere.
 

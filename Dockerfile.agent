@@ -6,7 +6,7 @@ COPY requirements-agent.txt .
 RUN pip install --no-cache-dir -r requirements-agent.txt
 
 # app/ is needed for app.auth.verify_token — reused directly, not
-# reimplemented (same as rag_harness and rule_engine).
+# reimplemented (same as rag_service and rule_engine).
 COPY app/ ./app/
 COPY agent/ ./agent/
 

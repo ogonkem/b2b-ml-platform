@@ -8,17 +8,17 @@ no fixed price (`price_amount` is None) and is sales-assisted, not sold
 through automated checkout.
 
 rag_ingestion_quota / rag_retrieval_quota: bundled monthly allowance for
-rag_harness (RAG document ingestion / retrieval), enforced the same way as
-monthly_quota is for predictions — see rag_harness/main.py. Not billed as a
+rag_service (RAG document ingestion / retrieval), enforced the same way as
+monthly_quota is for predictions — see rag_service/main.py. Not billed as a
 separate line item yet; every tier's allowance is included in its existing
 price. rag_ingestion_quota counts documents ingested (POST /v1/documents),
-not MB — see rag_harness/main.py for why.
+not MB — see rag_service/main.py for why.
 
 "agent" tier: one price covering prediction quota + agent orchestration
 (POST /v1/agent/assess), with RAG quota bundled in like every other tier.
 There is no separate "agent calls/mo" quota field — agent/graph.py's
 predict and retrieve steps call Selastone's own /v1/predict and
-rag_harness's /v1/retrieve, which already enforce monthly_quota and
+rag_service's /v1/retrieve, which already enforce monthly_quota and
 rag_retrieval_quota respectively, so an assessment is already metered
 through those two existing counters with no new billing dimension needed.
 """

@@ -1,7 +1,7 @@
 """
 agent/clients.py
 Thin HTTP clients for the three services this graph orchestrates
-(Selastone's core API, rag_harness, rule_engine — all separate deployments,
+(Selastone's core API, rag_service, rule_engine — all separate deployments,
 so these are real HTTP calls, not in-process function calls), plus the one
 LLM call the graph makes (synthesize). No retries or circuit-breaking here —
 a failure surfaces immediately as a 502 from POST /v1/agent/assess, since a
@@ -18,7 +18,7 @@ import os
 import requests
 
 SELASTONE_API_URL = os.environ.get("SELASTONE_API_URL", "http://api:8000")
-RAG_HARNESS_URL   = os.environ.get("RAG_HARNESS_URL",   "http://rag_harness:8001")
+RAG_SERVICE_URL   = os.environ.get("RAG_SERVICE_URL",   "http://rag_service:8001")
 RULE_ENGINE_URL   = os.environ.get("RULE_ENGINE_URL",   "http://rule_engine:8002")
 
 REQUEST_TIMEOUT = 15  # seconds
@@ -52,7 +52,7 @@ def call_predict(applicant: dict, token: str) -> dict:
 
 def call_retrieve(tenant_id: str, query: str, token: str, top_k: int = 5) -> list:
     return _post(
-        "rag_harness /v1/retrieve", f"{RAG_HARNESS_URL}/v1/retrieve",
+        "rag_service /v1/retrieve", f"{RAG_SERVICE_URL}/v1/retrieve",
         {"tenant_id": tenant_id, "query": query, "top_k": top_k}, token,
     )
 
@@ -76,8 +76,8 @@ def call_decide(
 
 
 # ── LLM synthesis (the only LLM call in the graph) ──────────────────────────
-# Same provider/tradeoff as rag_harness's embeddings (OpenAI text-embedding-
-# 3-small) — see rag_harness/ingest_task.py's module docstring for the full
+# Same provider/tradeoff as rag_service's embeddings (OpenAI text-embedding-
+# 3-small) — see rag_service/ingest_task.py's module docstring for the full
 # external-API discussion, not repeated here. Model choice specifically for
 # this call: a small, cheap chat model is enough because the prompt is
 # heavily grounded (every number it may cite is handed to it verbatim in

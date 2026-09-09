@@ -1,13 +1,13 @@
 """
-rag_harness/main.py
+rag_service/main.py
 Standalone FastAPI service for the RAG document-ingestion/retrieval
-pipeline. Runs as its own container (see docker-compose.yml's rag_harness
+pipeline. Runs as its own container (see docker-compose.yml's rag_service
 service) but shares the main stack's existing infrastructure rather than
 provisioning its own:
-  - Postgres — same instance as the api, new `rag` schema (rag_harness/db.py)
+  - Postgres — same instance as the api, new `rag` schema (rag_service/db.py)
   - MinIO    — same instance as the api, new `doc-chunks-raw` bucket
   - Redis    — same instance as celery_worker, same Celery app (ingestion
-               runs as the rag_harness.ingest_task.ingest_document task);
+               runs as the rag_service.ingest_task.ingest_document task);
                also used here directly for per-tenant ingestion/retrieval
                quota counters, mirroring app.main.check_and_increment_quota
 
@@ -30,8 +30,8 @@ from minio import Minio
 from pydantic import BaseModel
 
 from app.auth import security_scheme, verify_token
-from rag_harness.db import get_cursor, init_schema
-from rag_harness.ingest_task import (
+from rag_service.db import get_cursor, init_schema
+from rag_service.ingest_task import (
     DOC_CHUNKS_BUCKET,
     _embed_batch,
     _extract_ext,
@@ -46,7 +46,7 @@ except ImportError:
     _celery_app = None
 
 app = FastAPI(
-    title="Selastone RAG Harness",
+    title="Selastone RAG Service",
     version="0.2.0",
     description="Document ingestion and retrieval harness for RAG pipelines.",
 )

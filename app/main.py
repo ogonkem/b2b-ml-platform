@@ -108,7 +108,7 @@ app.mount("/metrics", metrics_app)
 # security_scheme, VALID_TOKENS, and verify_token now live in app.auth (see
 # import above) — shared as-is with any other service in this repo that
 # needs to resolve the same bearer value to the same tenant_id, e.g.
-# rag_harness, without duplicating the three-way static/JWT/api-key logic.
+# rag_service, without duplicating the three-way static/JWT/api-key logic.
 
 # -------------------------------------------------------------------------
 # PYDANTIC SCHEMAS

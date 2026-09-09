@@ -13,7 +13,7 @@ Column notes (not self-evident from the DDL alone):
   - application_ref: the application's own identifier (echoed back from
     Selastone's /v1/predict as application_id), not a foreign key into any
     table here — this service doesn't store applications itself.
-  - retrieved_chunk_ids: just the UUIDs from rag_harness's /v1/retrieve
+  - retrieved_chunk_ids: just the UUIDs from rag_service's /v1/retrieve
     response, not the chunk text/scores — the full chunk content already
     lives in rag.doc_chunks; duplicating it here would let the two drift
     out of sync on a re-ingest. Look chunks up by id if the full text is

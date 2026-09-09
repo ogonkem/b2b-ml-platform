@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, type FormEvent } from "react";
-import { apiGet, apiUpload, ApiError, RAG_HARNESS_BASE_URL } from "../api/client";
+import { apiGet, apiUpload, ApiError, RAG_SERVICE_BASE_URL } from "../api/client";
 
 interface DocumentSummary {
   id: string;
@@ -36,7 +36,7 @@ export default function Policies() {
 
   const loadDocs = useCallback(async () => {
     try {
-      const resp = await apiGet<DocumentSummary[]>("/v1/documents", RAG_HARNESS_BASE_URL);
+      const resp = await apiGet<DocumentSummary[]>("/v1/documents", RAG_SERVICE_BASE_URL);
       setDocs(resp);
     } catch {
       // non-fatal — the table just won't refresh this tick
@@ -45,7 +45,7 @@ export default function Policies() {
 
   const loadUsage = useCallback(async () => {
     try {
-      const resp = await apiGet<UsageResponse>("/v1/usage", RAG_HARNESS_BASE_URL);
+      const resp = await apiGet<UsageResponse>("/v1/usage", RAG_SERVICE_BASE_URL);
       setUsage(resp);
     } catch {
       // non-fatal
@@ -56,7 +56,7 @@ export default function Policies() {
     const entries = await Promise.all(
       docList.map(async (d) => {
         try {
-          const resp = await apiGet<StatusResponse>(`/v1/documents/status/${d.id}`, RAG_HARNESS_BASE_URL);
+          const resp = await apiGet<StatusResponse>(`/v1/documents/status/${d.id}`, RAG_SERVICE_BASE_URL);
           return [d.id, resp] as const;
         } catch {
           return null;
@@ -94,7 +94,7 @@ export default function Policies() {
     setError(null);
     setUploading(true);
     try {
-      await apiUpload<UploadResponse>("/v1/documents", file, RAG_HARNESS_BASE_URL);
+      await apiUpload<UploadResponse>("/v1/documents", file, RAG_SERVICE_BASE_URL);
       setFile(null);
       await loadDocs();
     } catch (err) {

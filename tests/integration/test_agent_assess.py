@@ -1,12 +1,12 @@
 # Requires the full docker stack running: docker compose up -d
 #
 # Additionally requires a real OPENAI_API_KEY in .env — POST /v1/agent/assess
-# always calls rag_harness's /v1/retrieve (embeds the query) and always ends
+# always calls rag_service's /v1/retrieve (embeds the query) and always ends
 # with an LLM synthesis call (agent/graph.py's node_synthesize). Without a
 # real key, every test here is skipped rather than failing.
 #
 # Also requires the three demo tenant docs already ingested — this file
-# assumes tests/integration/test_rag_harness.py has run first in the same
+# assumes tests/integration/test_rag_service.py has run first in the same
 # session (pytest collects/runs files in a session, and ingestion is left
 # in place afterward; see that file's own ingested_docs fixture). If run in
 # isolation with nothing ingested yet, these tests still pass: policy_aligned
@@ -33,7 +33,7 @@ pytestmark = pytest.mark.skipif(
 
 AGENT_URL = "http://localhost:8003"
 
-# Same three demo tenants as test_rag_harness.py, seeded in
+# Same three demo tenants as test_rag_service.py, seeded in
 # rule_engine/thresholds.py. Distinct fake applicant IDs per tenant so each
 # tenant's decision row is independently addressable via
 # GET /v1/agent/decisions/{application_ref} without colliding with another

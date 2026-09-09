@@ -6,7 +6,7 @@ services:
     # pgvector/pgvector:pg15 is a drop-in build of the same postgres:15 —
     # same major version, same on-disk data format — with the pgvector
     # extension included. Needed for rag.doc_chunks' embedding VECTOR(1536)
-    # column and ivfflat index (rag_harness/db.py); app.* and Airflow's own
+    # column and ivfflat index (rag_service/db.py); app.* and Airflow's own
     # tables are unaffected.
     image: pgvector/pgvector:pg15
     container_name: data-postgres
@@ -227,11 +227,11 @@ services:
   # directly, so any bearer value that already authenticates against the api
   # service works here too.
   # Swagger docs → http://localhost:8001/docs
-  rag_harness:
+  rag_service:
     build:
       context: .
-      dockerfile: Dockerfile.rag_harness
-    container_name: selastone-rag-harness
+      dockerfile: Dockerfile.rag_service
+    container_name: selastone-rag-service
     env_file:
       - .env
     ports:
@@ -255,10 +255,10 @@ services:
   # ── Rule Engine (FastAPI) ──────────────────────────────────────────────────
   # Deterministic, code-only loan decisioning (rule_engine/engine.py) — no
   # database, no object storage, no LLM/external API calls beyond reading
-  # rule_engine/thresholds.py. Its own service, not part of rag_harness, so
+  # rule_engine/thresholds.py. Its own service, not part of rag_service, so
   # this audit-critical path never depends on Postgres/MinIO/Redis/Celery/
   # OpenAI being healthy (see rule_engine/main.py for the full tradeoff).
-  # Reuses app.auth.verify_token directly, same as rag_harness.
+  # Reuses app.auth.verify_token directly, same as rag_service.
   # Swagger docs → http://localhost:8002/docs
   rule_engine:
     build:
@@ -280,7 +280,7 @@ services:
   # ── Decision Agent (FastAPI + LangGraph) ──────────────────────────────────
   # POST /v1/agent/assess — fixed-order orchestration (predict -> build
   # retrieval query -> retrieve policy -> rule-based decide -> LLM narrative
-  # -> audit) across the api, rag_harness, and rule_engine services. Own
+  # -> audit) across the api, rag_service, and rule_engine services. Own
   # Postgres schema (`agent`) for the audit trail (agent.agent_decisions);
   # no other storage of its own.
   # Swagger docs → http://localhost:8003/docs
@@ -306,7 +306,7 @@ services:
 
   # ── Frontend (React + Vite, served via nginx) ─────────────────────────────
   # JWT login/register + dashboard/predict/batch/labeled-data/usage/admin UI
-  # + agent assessment/policy-document pages (call agent/rag_harness directly)
+  # + agent assessment/policy-document pages (call agent/rag_service directly)
   # UI → http://localhost:3001
   frontend:
     build:
@@ -315,14 +315,14 @@ services:
       args:
         VITE_API_BASE_URL: http://localhost:8000
         VITE_AGENT_BASE_URL: http://localhost:8003
-        VITE_RAG_HARNESS_BASE_URL: http://localhost:8001
+        VITE_RAG_SERVICE_BASE_URL: http://localhost:8001
     container_name: selastone-frontend
     ports:
       - "3001:80"
     depends_on:
       - api
       - agent
-      - rag_harness
+      - rag_service
     networks:
       - backend-network
 

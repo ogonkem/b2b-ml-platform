@@ -1,6 +1,6 @@
 """
 tests/unit/test_rag_quota.py
-Real (non-mocked) exercise of rag_harness.main._check_and_increment_quota
+Real (non-mocked) exercise of rag_service.main._check_and_increment_quota
 against an in-memory fake Redis — mirrors tests/unit/test_quota.py's
 approach for app.main.check_and_increment_quota, since the two functions
 are deliberately built to the same pattern (check-before-increment, atomic
@@ -20,8 +20,8 @@ with patch("psycopg2.connect") as _mock_connect, \
     _mock_connect.return_value = MagicMock()
     _mock_minio_cls.return_value = MagicMock(bucket_exists=lambda *_: True)
 
-    import rag_harness.main as rag_main
-    from rag_harness.main import (
+    import rag_service.main as rag_main
+    from rag_service.main import (
         RAG_INGESTION_QUOTA_PREFIX,
         RAG_RETRIEVAL_QUOTA_PREFIX,
         _check_and_increment_quota,
@@ -111,7 +111,7 @@ class TestQuotaMechanics:
 
     def test_does_not_collide_with_selastones_own_prediction_quota_key(self, fake_redis):
         """app.main's own prediction quota lives under the "quota:" prefix
-        on the same Redis instance/DB. If rag_harness reused that literal
+        on the same Redis instance/DB. If rag_service reused that literal
         prefix, a tenant's RAG usage would silently share (and corrupt) the
         same counter as its prediction usage. Confirm the real keys used
         here never collide with that prefix."""

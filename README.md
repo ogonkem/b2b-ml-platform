@@ -410,13 +410,13 @@ Served in production via `Dockerfile.frontend` — a multi-stage build (Node bui
 
 ## 12. Agentic, policy-grounded loan decisioning
 
-**`rag_harness/` (port 8001) + `rule_engine/` (port 8002) + `agent/` (port 8003)**
+**`rag_service/` (port 8001) + `rule_engine/` (port 8002) + `agent/` (port 8003)**
 
 On top of the statistical risk score from [§6](#6-prediction-api), a tenant can ask for a *decision* — an approve/refer/reject outcome that cites both the SHAP factors behind the score and the specific clause of the tenant's own lending policy that applies, with a plain-language explanation of both. Three new services do this, each independently deployable but sharing all of the existing infrastructure — same Postgres instance (new `rag`/`agent` schemas), same MinIO instance (new `doc-chunks-raw` bucket), same Redis instance and Celery app, same `app.auth.verify_token()` — nothing here spins up parallel infra or reimplements auth.
 
-### rag_harness — document ingestion and hybrid retrieval
+### rag_service — document ingestion and hybrid retrieval
 
-**Ingestion (`rag_harness/ingest_task.py`)** runs as a Celery task on the existing `celery_worker` (registered in `celery_worker/celery_app.py`'s `include` list, not a separate Celery instance). `POST /v1/documents` uploads a policy document (PDF/DOCX/MD/TXT), enqueues the task, and returns immediately — the same fire-and-poll pattern as [batch scoring](#7-async-batch-pipeline). The pipeline:
+**Ingestion (`rag_service/ingest_task.py`)** runs as a Celery task on the existing `celery_worker` (registered in `celery_worker/celery_app.py`'s `include` list, not a separate Celery instance). `POST /v1/documents` uploads a policy document (PDF/DOCX/MD/TXT), enqueues the task, and returns immediately — the same fire-and-poll pattern as [batch scoring](#7-async-batch-pipeline). The pipeline:
 
 1. Upload the original file to MinIO at `{tenant_id}/{doc_id}/{version}/original.{ext}`
 2. Extract text — `pdfplumber` for PDF, `python-docx` for DOCX, passthrough for MD/TXT
@@ -429,7 +429,7 @@ This is the one real network dependency and per-token cost in an otherwise fully
 
 **Retrieval — `POST /v1/retrieve`** runs two ranked queries against `rag.doc_chunks` — pgvector cosine similarity (`embedding <=> query_vector`, top 20) and Postgres full-text (`plainto_tsquery` against a generated `tsvector` column, GIN-indexed, top 20) — and merges them with **Reciprocal Rank Fusion** (`score = Σ 1/(60 + rank)` across whichever lists a chunk appears in). Hybrid search this way catches both semantic paraphrase matches the keyword search would miss and exact-term matches (a specific rate or clause number) the embedding might rank lower.
 
-**Tenant isolation is a hard `WHERE tenant_id = %s` clause in both underlying queries, evaluated before `ORDER BY`/`LIMIT` — never a filter applied to the merged result afterward.** A chunk belonging to another tenant, no matter how close a semantic or lexical match, never enters either candidate list in the first place, so RRF has nothing of theirs to rank. This is proven two ways: a unit test that inspects the actual SQL/params passed to the DB layer (`tests/unit/test_rag_retrieve.py`), and a live integration test (`tests/integration/test_rag_harness.py`) that ingests two tenants' real documents and queries as one tenant with text deliberately closer to the *other* tenant's content, asserting zero of that tenant's chunks come back.
+**Tenant isolation is a hard `WHERE tenant_id = %s` clause in both underlying queries, evaluated before `ORDER BY`/`LIMIT` — never a filter applied to the merged result afterward.** A chunk belonging to another tenant, no matter how close a semantic or lexical match, never enters either candidate list in the first place, so RRF has nothing of theirs to rank. This is proven two ways: a unit test that inspects the actual SQL/params passed to the DB layer (`tests/unit/test_rag_retrieve.py`), and a live integration test (`tests/integration/test_rag_service.py`) that ingests two tenants' real documents and queries as one tenant with text deliberately closer to the *other* tenant's content, asserting zero of that tenant's chunks come back.
 
 **Quotas** mirror `app.main.check_and_increment_quota`'s exact pattern (check-before-increment, atomic `INCRBY`, ~32-day TTL) under their own Redis key prefixes (`rag_ingest_quota:`/`rag_retrieve_quota:`, deliberately distinct from `quota:` so the two services' counters for the same tenant never collide in the same Redis instance) — `rag_ingestion_quota` counts documents ingested, `rag_retrieval_quota` counts `/v1/retrieve` calls, both read from the tenant's existing plan (`app/plans.py`, no separate RAG billing). `GET /v1/usage` reports both nested, same shape philosophy as `app.main`'s own usage endpoint.
 
@@ -455,7 +455,7 @@ predict → build_retrieval_query → retrieve → decide → synthesize → aud
 
 1. **predict** — calls Selastone's own `POST /v1/predict` ([§6](#6-prediction-api)) over real HTTP (this service is its own deployment, not in-process with `app`), getting back `risk_score` and the SHAP-explained `shap_factors`
 2. **build_retrieval_query** — pure Python, no I/O: turns the top SHAP factor plus the loan type into a natural-language query (e.g. `debt_to_income` + `real_estate_payment_plan` → *"debt to income ratio threshold real estate payment plan"*), via a small alias table for the raw feature names `shared/features.py`'s `FeaturePipeline` actually produces (`dtir1`, `loan_to_property`, …)
-3. **retrieve** — calls rag_harness's `POST /v1/retrieve`, tenant-scoped, top 5 chunks
+3. **retrieve** — calls rag_service's `POST /v1/retrieve`, tenant-scoped, top 5 chunks
 4. **decide** — calls rule_engine's `POST /v1/decide`; if step 3 returned zero chunks, this step is told to use `FALLBACK_RISK_BANDS` instead of this tenant's real policy, and the response is marked `policy_aligned: false` rather than skipped outright — a decision still gets made, just not one grounded in retrieved policy text
 5. **synthesize** — the only LLM call (`gpt-4o-mini`, chosen for cost since the prompt is heavily grounded already) — explicitly instructed to cite the statistical factors *and* the specific retrieved clause/section, quote threshold values verbatim from what was actually triggered, and never invent a number or policy detail not present in the prompt's own grounding data
 6. **audit** — writes the full trace to `agent.agent_decisions`
@@ -464,7 +464,7 @@ The response — `{decision, risk_score, statistical_factors, policy_basis, poli
 
 **`agent.agent_decisions`** (idempotent DDL, `agent/db.py`) is the full audit row per assessment: `tenant_id`, `application_ref` (echoed from `/v1/predict`'s `application_id`), `risk_score`, `model_version`, `rule_engine_version`, `decision`, `triggered_thresholds` (JSONB), `retrieved_chunk_ids` (`UUID[]` — just the ids, not the chunk text, so it can never drift out of sync with `rag.doc_chunks` on a re-ingest), `policy_doc_version` (the top-ranked retrieved chunk's version, `NULL` when nothing was retrieved), `policy_aligned`, and `llm_narrative`. `GET /v1/agent/decisions/{application_ref}` returns every decision ever made for that application (newest first — a reassessment doesn't hide the history), and `GET /v1/agent/decisions?tenant_id=&policy_doc_version=` supports "show every decision made under policy version Y" for compliance review after a policy update.
 
-**Testing**: `tests/unit/test_agent_graph.py` mocks all four upstream calls and asserts fixed node order plus the zero-chunks-retrieved fallback path; `tests/integration/test_agent_assess.py` runs the real graph end-to-end against the real `rule_engine.decide()` function per demo tenant with a synthetic high-risk applicant, checking the decision, the policy citations, and the `agent.agent_decisions` row all landed correctly — gated behind a real `OPENAI_API_KEY` like the rag_harness integration tests above it, since every assessment ends in a real LLM synthesis call.
+**Testing**: `tests/unit/test_agent_graph.py` mocks all four upstream calls and asserts fixed node order plus the zero-chunks-retrieved fallback path; `tests/integration/test_agent_assess.py` runs the real graph end-to-end against the real `rule_engine.decide()` function per demo tenant with a synthetic high-risk applicant, checking the decision, the policy citations, and the `agent.agent_decisions` row all landed correctly — gated behind a real `OPENAI_API_KEY` like the rag_service integration tests above it, since every assessment ends in a real LLM synthesis call.
 
 ### Frontend
 
@@ -476,8 +476,8 @@ Two pages consume all three services, matching the existing app's conventions ex
 ### Infrastructure notes
 
 - Postgres runs `pgvector/pgvector:pg15` instead of vanilla `postgres:15-alpine` — a drop-in, same-on-disk-format swap needed for the `VECTOR(1536)` column type and its `ivfflat` cosine index.
-- `rag_harness`, `rule_engine`, and `agent` each build from their own `Dockerfile.*`, each also copying in `app/` so they can import `app.auth.verify_token()` without reimplementing it.
-- `agent/clients.py` calls the other two services over real HTTP using in-cluster docker-compose hostnames (`SELASTONE_API_URL`, `RAG_HARNESS_URL`, `RULE_ENGINE_URL`) — everything here is its own deployment, unlike `ModelManager`'s in-process model swap in [§6](#6-prediction-api).
+- `rag_service`, `rule_engine`, and `agent` each build from their own `Dockerfile.*`, each also copying in `app/` so they can import `app.auth.verify_token()` without reimplementing it.
+- `agent/clients.py` calls the other two services over real HTTP using in-cluster docker-compose hostnames (`SELASTONE_API_URL`, `RAG_SERVICE_URL`, `RULE_ENGINE_URL`) — everything here is its own deployment, unlike `ModelManager`'s in-process model swap in [§6](#6-prediction-api).
 
 ---
 
@@ -508,7 +508,7 @@ pip install mlflow httpx pytest pytest-asyncio python-dotenv minio
 python -m pytest tests/integration/ -v
 ```
 
-Set a real `OPENAI_API_KEY` in `.env` to exercise document ingestion, retrieval, and `POST /v1/agent/assess` ([§12](#12-agentic-policy-grounded-loan-decisioning)) — without it, `rag_harness`/`agent` still start and serve every non-embedding endpoint, and `tests/integration/test_rag_harness.py`/`test_agent_assess.py` skip cleanly instead of failing.
+Set a real `OPENAI_API_KEY` in `.env` to exercise document ingestion, retrieval, and `POST /v1/agent/assess` ([§12](#12-agentic-policy-grounded-loan-decisioning)) — without it, `rag_service`/`agent` still start and serve every non-embedding endpoint, and `tests/integration/test_rag_service.py`/`test_agent_assess.py` skip cleanly instead of failing.
 
 **Service endpoints:**
 
@@ -516,7 +516,7 @@ Set a real `OPENAI_API_KEY` in `.env` to exercise document ingestion, retrieval,
 |-------------------------------|---|
 | Frontend (login/dashboard/admin) | http://localhost:3001 |
 | Prediction API + Swagger docs | http://localhost:8000/docs |
-| RAG harness (documents, retrieval) | http://localhost:8001/docs |
+| RAG service (documents, retrieval) | http://localhost:8001/docs |
 | Rule engine (decisioning)     | http://localhost:8002/docs |
 | Decision agent (`/v1/agent/assess`) | http://localhost:8003/docs |
 | MLflow experiment tracker     | http://localhost:5000      |
@@ -539,7 +539,7 @@ Set a real `OPENAI_API_KEY` in `.env` to exercise document ingestion, retrieval,
 │   └── model_manager.py     # Polling hot-swap daemon — threading.Lock + MLflow registry
 ├── scripts/
 │   └── setup_paystack_plans.py  # One-time: creates Paystack Plan objects from app/plans.py (see §11)
-├── rag_harness/              # FastAPI (8001): document ingestion + hybrid retrieval (see §12)
+├── rag_service/              # FastAPI (8001): document ingestion + hybrid retrieval (see §12)
 │   ├── main.py                #   /v1/retrieve, /v1/documents, /v1/usage, quota enforcement
 │   ├── ingest_task.py          #   Celery task: extract → chunk → embed → diff-reingest
 │   └── db.py                   #   rag schema: documents, doc_chunks (pgvector + full-text)
@@ -550,7 +550,7 @@ Set a real `OPENAI_API_KEY` in `.env` to exercise document ingestion, retrieval,
 ├── agent/                     # FastAPI (8003): LangGraph orchestrator (see §12)
 │   ├── main.py                  #   POST /v1/agent/assess, GET /v1/agent/decisions*
 │   ├── graph.py                  #   Six-node fixed pipeline: predict→...→audit
-│   ├── clients.py                 #   HTTP calls to app/rag_harness/rule_engine + LLM synthesis
+│   ├── clients.py                 #   HTTP calls to app/rag_service/rule_engine + LLM synthesis
 │   └── db.py                       #   agent schema: agent_decisions (full audit trail)
 ├── frontend/                # React + Vite + TS SPA — login/dashboard/predict/batch/usage/admin/agent/policies (see §11, §12)
 ├── shared/
@@ -572,10 +572,10 @@ Set a real `OPENAI_API_KEY` in `.env` to exercise document ingestion, retrieval,
 ├── tests/
 │   ├── unit/                # Isolated unit tests — all external calls mocked
 │   └── integration/         # Live stack tests: API endpoints, batch pipeline, MLops loop,
-│                             #   rag_harness ingestion/retrieval/isolation/quota, agent assess (see §12)
+│                             #   rag_service ingestion/retrieval/isolation/quota, agent assess (see §12)
 ├── docker-compose.yml       # 14-service stack on a shared bridge network
 ├── Dockerfile.api           # Python 3.12-slim — shared image for API and Celery worker
-├── Dockerfile.rag_harness   # rag_harness service image — bundles app/ for auth reuse (see §12)
+├── Dockerfile.rag_service   # rag_service service image — bundles app/ for auth reuse (see §12)
 ├── Dockerfile.rule_engine   # rule_engine service image — pure Python, no ML stack (see §12)
 ├── Dockerfile.agent         # agent service image — langgraph + openai, bundles app/ (see §12)
 ├── Dockerfile.airflow       # apache/airflow + git/dvc + the ML stack the DAGs need (see §8)

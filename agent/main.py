@@ -1,11 +1,11 @@
 """
 agent/main.py
 FastAPI wrapper exposing POST /v1/agent/assess — orchestrates Selastone's
-/v1/predict, rag_harness's /v1/retrieve, and rule_engine's /v1/decide via
+/v1/predict, rag_service's /v1/retrieve, and rule_engine's /v1/decide via
 the fixed LangGraph pipeline in agent/graph.py, then an LLM synthesis step
 and an audit write (agent.agent_decisions).
 
-Its own service, like rag_harness and rule_engine — depends on Postgres
+Its own service, like rag_service and rule_engine — depends on Postgres
 (for the audit trail) and the three services it calls over HTTP, plus
 app.auth for auth reuse. All three downstream calls are real HTTP calls
 (not in-process function calls), since each lives in its own deployment.
@@ -31,7 +31,7 @@ app = FastAPI(
 )
 
 # The frontend SPA calls this service directly (pages/AgentAssess.tsx) —
-# same CORS setup as app/main.py and rag_harness/main.py.
+# same CORS setup as app/main.py and rag_service/main.py.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.environ.get("FRONTEND_ORIGINS", "http://localhost:5173").split(","),
@@ -85,7 +85,7 @@ async def assess(
     token: Optional[HTTPAuthorizationCredentials] = Security(security_scheme),
 ):
     tenant = verify_token(token)
-    # Same convention as rag_harness/rule_engine: tenant_id comes from the
+    # Same convention as rag_service/rule_engine: tenant_id comes from the
     # authenticated token, the body's copy is only ever checked against it.
     if payload.tenant_id != tenant:
         raise HTTPException(status_code=403, detail="tenant_id does not match authenticated token")

@@ -50,7 +50,7 @@ DECISION_SEVERITY = {"approve": 0, "refer": 1, "reject": 2}
 TENANT_THRESHOLDS = {
     # Numbers as given in this feature's spec for the "commercial bank" example
     # tenant. Note: tests/fixtures/policy_docs/1_commercial_bank_lending_policy.md
-    # (written for the rag_harness chunking tests) uses different illustrative
+    # (written for the rag_service chunking tests) uses different illustrative
     # numbers (LTV/DSCR/approval-authority tiers, no DTI or risk bands) — the
     # two aren't currently reconciled to state the same numbers.
     "commercial_bank": {
@@ -94,7 +94,7 @@ TENANT_THRESHOLDS = {
 
 # Used by decide(..., use_fallback=True) — a generic, tenant-agnostic,
 # risk-score-only band structure for when the caller (agent/graph.py) has
-# no policy documents to ground a tenant-specific decision in (rag_harness's
+# no policy documents to ground a tenant-specific decision in (rag_service's
 # /v1/retrieve returned zero chunks). Deliberately conservative and with no
 # DTI/cap rules at all: applying a specific tenant's numeric policy without
 # any retrieved policy text to cite would misrepresent the decision as

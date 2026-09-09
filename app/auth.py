@@ -35,7 +35,7 @@ _security = HTTPBearer(auto_error=False)
 
 # security_scheme/VALID_TOKENS/verify_token live here (not just decode_jwt)
 # so any service in this repo — app.main's own endpoints, or a separate
-# container like rag_harness — can resolve a bearer value to a tenant_id
+# container like rag_service — can resolve a bearer value to a tenant_id
 # via one shared import, without pulling in app.main's model-serving setup.
 security_scheme = HTTPBearer(auto_error=False)
 VALID_TOKENS    = set(os.environ.get("API_TOKENS", "dev-token").split(","))
@@ -133,7 +133,7 @@ def _lookup_api_key_tenant(raw_key: str) -> Optional[str]:
 def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Security(security_scheme)) -> str:
     """Accepts three kinds of bearer value, in order, all resolving to a
     tenant_id — callers (app.main's endpoints, or any other service in this
-    repo, e.g. rag_harness) don't need to know which kind was used:
+    repo, e.g. rag_service) don't need to know which kind was used:
       1. A static, pre-shared API_TOKENS entry — tenant_id is the token itself.
       2. A JWT issued by /auth/login or /auth/register — tenant_id comes from
          the JWT's own claim.

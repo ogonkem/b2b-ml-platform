@@ -44,7 +44,7 @@ def decide(
     use_fallback=True bypasses tenant-specific config entirely (regardless
     of whether tenant_id is otherwise known) and applies FALLBACK_RISK_BANDS
     instead — a generic, risk-score-only judgment call with no DTI/cap
-    rules. Intended for agent/graph.py's case where rag_harness's
+    rules. Intended for agent/graph.py's case where rag_service's
     /v1/retrieve found no policy documents for this tenant: applying a
     tenant's specific numeric policy with no retrieved text to back it up
     would misrepresent the decision as grounded in a policy it never

@@ -9,7 +9,7 @@ COPY requirements-rule-engine.txt .
 RUN pip install --no-cache-dir -r requirements-rule-engine.txt
 
 # app/ is needed for app.auth.verify_token — reused directly, not
-# reimplemented (same as rag_harness).
+# reimplemented (same as rag_service).
 COPY app/ ./app/
 COPY rule_engine/ ./rule_engine/
 

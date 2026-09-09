@@ -1,6 +1,6 @@
 # ── agent service dependencies ────────────────────────────────────────────────
 # No ML/RAG stack (xgboost, pdfplumber, ...) — this service only orchestrates
-# HTTP calls to the api/rag_harness/rule_engine services and makes one LLM
+# HTTP calls to the api/rag_service/rule_engine services and makes one LLM
 # call of its own. Versions copied from requirements.txt where they overlap,
 # to stay in lockstep with the rest of the project.
 
@@ -19,7 +19,7 @@ PyJWT==2.13.0
 bcrypt==4.2.1
 email-validator==2.3.0
 
-# Calling api / rag_harness / rule_engine over HTTP
+# Calling api / rag_service / rule_engine over HTTP
 requests==2.34.2
 
 # Orchestration (agent/graph.py)
@@ -40,8 +40,8 @@ xxhash==4.0.1
 uuid_utils==0.17.1
 distro==1.9.0
 
-# Synthesis LLM call (agent/clients.py) — same provider as rag_harness's
-# embeddings; see rag_harness/ingest_task.py's module docstring for the
+# Synthesis LLM call (agent/clients.py) — same provider as rag_service's
+# embeddings; see rag_service/ingest_task.py's module docstring for the
 # tradeoff discussion.
 openai==3.8.0
 httpx2==2.12.0
