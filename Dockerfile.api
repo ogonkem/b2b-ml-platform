@@ -15,6 +15,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ ./app/
 COPY shared/ ./shared/
 COPY celery_worker/ ./celery_worker/
+# rag_harness/ingest_task.py is registered on this same Celery app (see
+# celery_worker/celery_app.py's `include` list) — the celery_worker
+# container built from this image needs it importable too.
+COPY rag_harness/ ./rag_harness/
 
 # Run uvicorn
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

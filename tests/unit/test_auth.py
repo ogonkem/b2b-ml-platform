@@ -20,6 +20,16 @@ with patch("redis.Redis") as mock_redis, \
 
 client = TestClient(app)
 
+# app.auth.VALID_TOKENS is computed once, at whichever test file imports
+# app.auth *first* in the whole pytest session — not necessarily this one,
+# despite the os.environ["API_TOKENS"] set above. Other test files (e.g.
+# test_agent_api.py, test_rag_retrieve.py) sort before this one
+# alphabetically and import app.auth (via agent.main/rag_harness.main)
+# with their own tokens, so relying on import order here is fragile.
+# Mutating the already-imported set directly sidesteps that.
+from app.auth import VALID_TOKENS
+VALID_TOKENS.update({"dev-token", "tenant-abc"})
+
 SAMPLE = {
     "ID": 1,
     "year": 2023,

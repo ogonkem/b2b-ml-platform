@@ -1,0 +1,50 @@
+# ── agent service dependencies ────────────────────────────────────────────────
+# No ML/RAG stack (xgboost, pdfplumber, ...) — this service only orchestrates
+# HTTP calls to the api/rag_harness/rule_engine services and makes one LLM
+# call of its own. Versions copied from requirements.txt where they overlap,
+# to stay in lockstep with the rest of the project.
+
+fastapi==0.136.3
+uvicorn==0.48.0
+starlette==1.1.0
+python-multipart==0.0.32
+
+pydantic==2.13.4
+pydantic_core==2.46.4
+annotated-types==0.7.0
+
+# app.auth's own dependencies
+psycopg2-binary==2.9.10
+PyJWT==2.13.0
+bcrypt==4.2.1
+email-validator==2.3.0
+
+# Calling api / rag_harness / rule_engine over HTTP
+requests==2.34.2
+
+# Orchestration (agent/graph.py)
+langgraph==1.2.11
+langgraph-checkpoint==4.2.0
+langgraph-prebuilt==1.1.0
+langgraph-sdk==0.4.4
+langchain-core==1.6.2
+langchain-protocol==0.0.19
+langsmith==0.12.2
+jsonpatch==1.33
+jsonpointer==3.1.1
+orjson==3.11.9
+ormsgpack==1.12.2
+requests-toolbelt==1.0.0
+websockets==16.0
+xxhash==4.0.1
+uuid_utils==0.17.1
+distro==1.9.0
+
+# Synthesis LLM call (agent/clients.py) — same provider as rag_harness's
+# embeddings; see rag_harness/ingest_task.py's module docstring for the
+# tradeoff discussion.
+openai==3.8.0
+httpx2==2.12.0
+httpcore2==2.12.0
+jiter==0.16.0
+truststore==0.10.4

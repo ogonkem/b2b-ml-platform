@@ -512,6 +512,100 @@ label {
   margin: 0.35rem 0;
 }
 
+/* ── Agent assess ───────────────────────────────────────────────────────── */
+
+.checkbox-label {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.5rem;
+}
+.checkbox-label input[type="checkbox"] {
+  width: auto;
+}
+
+.assess-result {
+  margin-top: 1.4rem;
+  max-width: none;
+}
+.assess-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  margin-top: 1rem;
+}
+@media (max-width: 760px) {
+  .assess-columns {
+    grid-template-columns: 1fr;
+  }
+}
+
+.citation-card {
+  padding: 0.9rem 1.1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  margin-bottom: 0.85rem;
+}
+.citation-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+.citation-card p {
+  margin: 0;
+  font-size: 0.9rem;
+}
+.citation-score {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+/* ── Policies ───────────────────────────────────────────────────────────── */
+
+.status-badge {
+  display: inline-block;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  padding: 0.12rem 0.5rem;
+  border-radius: 999px;
+}
+.status-queued,
+.status-unknown {
+  background: var(--bg-subtle);
+  color: var(--text-muted);
+}
+.status-processing {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+.status-complete {
+  background: var(--success-bg);
+  color: var(--success);
+}
+.status-failed {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+.status-error {
+  margin: 0.4rem 0 0;
+  max-width: 320px;
+  white-space: normal;
+}
+
+.quota-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  max-width: 480px;
+}
+.quota-bars .quota-bar-wrap {
+  max-width: none;
+}
+
 /* ── Plans ──────────────────────────────────────────────────────────────── */
 
 .plan-tag {

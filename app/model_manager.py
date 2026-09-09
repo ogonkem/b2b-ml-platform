@@ -34,6 +34,15 @@ class ModelManager:
     def version(self):
         return self._version
 
+    @property
+    def model(self):
+        """The raw underlying model (already unwrapped from MLflow's pyfunc
+        wrapper via get_raw_model() in load_latest()) — needed by callers
+        that must inspect the model itself, e.g. shap.Explainer for
+        /v1/predict's shap_factors, which can't work through a pyfunc
+        wrapper's predict-only interface."""
+        return self._model
+
     def load_latest(self):
         try:
             import mlflow.pyfunc

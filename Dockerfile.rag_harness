@@ -1,0 +1,26 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Build tools required by shap (C extensions) and other compiled packages —
+# rag_harness itself doesn't import them, but it installs the same shared
+# requirements.txt as the api image.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc g++ && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# app/ is needed for app.auth.verify_token and app.db's connection pattern —
+# rag_harness reuses these directly rather than reimplementing them.
+COPY app/ ./app/
+COPY rag_harness/ ./rag_harness/
+# celery_worker/celery_app.py is the shared Celery app that POST
+# /v1/documents enqueues onto (celery_app.send_task("ingest_document", ...))
+# — same broker/backend as celery_worker/tasks.py's own tasks.
+COPY celery_worker/ ./celery_worker/
+
+# Run uvicorn
+CMD ["uvicorn", "rag_harness.main:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]

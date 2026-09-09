@@ -50,6 +50,20 @@ const icons = {
       <circle cx="15" cy="9" r="1.4" />
     </Icon>
   ),
+  assess: (
+    <Icon>
+      <circle cx="11" cy="11" r="7" />
+      <path d="M16 16l5 5" />
+      <path d="M8.5 11l2 2 3.5-4" />
+    </Icon>
+  ),
+  policies: (
+    <Icon>
+      <path d="M6.5 3.5h8l4 4v13a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-16a1 1 0 0 1 1-1Z" />
+      <path d="M14.5 3.5v4h4" />
+      <path d="M8.5 12.5h7M8.5 16h4.5" />
+    </Icon>
+  ),
   usage: (
     <Icon>
       <path d="M4 20V10M11 20V4M18 20v-7" />
@@ -117,6 +131,8 @@ const NAV_ITEMS: { to: string; label: string; icon: keyof typeof icons }[] = [
   { to: "/predict", label: "Predict", icon: "predict" },
   { to: "/batch", label: "Batch Upload", icon: "batch" },
   { to: "/labeled-data", label: "Labeled Data", icon: "labeled" },
+  { to: "/agent/assess", label: "Agent Assess", icon: "assess" },
+  { to: "/policies", label: "Policies", icon: "policies" },
   { to: "/usage", label: "Usage", icon: "usage" },
   { to: "/plans", label: "Plans", icon: "plans" },
   { to: "/api-docs", label: "API Docs", icon: "docs" },

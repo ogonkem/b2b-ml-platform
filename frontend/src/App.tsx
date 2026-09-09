@@ -14,6 +14,8 @@ import Account from "./pages/Account";
 import Admin from "./pages/Admin";
 import Plans from "./pages/Plans";
 import ApiDocs from "./pages/ApiDocs";
+import AgentAssess from "./pages/AgentAssess";
+import Policies from "./pages/Policies";
 
 export default function App() {
   return (
@@ -30,6 +32,8 @@ export default function App() {
                 <Route path="/predict" element={<Predict />} />
                 <Route path="/batch" element={<Batch />} />
                 <Route path="/labeled-data" element={<LabeledData />} />
+                <Route path="/agent/assess" element={<AgentAssess />} />
+                <Route path="/policies" element={<Policies />} />
                 <Route path="/usage" element={<Usage />} />
                 <Route path="/plans" element={<Plans />} />
                 <Route path="/api-docs" element={<ApiDocs />} />

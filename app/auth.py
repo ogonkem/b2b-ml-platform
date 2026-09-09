@@ -33,6 +33,13 @@ JWT_EXPIRE_MINUTES = int(os.environ.get("JWT_EXPIRE_MINUTES", 1440))
 
 _security = HTTPBearer(auto_error=False)
 
+# security_scheme/VALID_TOKENS/verify_token live here (not just decode_jwt)
+# so any service in this repo — app.main's own endpoints, or a separate
+# container like rag_harness — can resolve a bearer value to a tenant_id
+# via one shared import, without pulling in app.main's model-serving setup.
+security_scheme = HTTPBearer(auto_error=False)
+VALID_TOKENS    = set(os.environ.get("API_TOKENS", "dev-token").split(","))
+
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
@@ -102,6 +109,62 @@ def decode_jwt(token: str) -> Optional[dict]:
         return jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
     except jwt.PyJWTError:
         return None
+
+
+def _lookup_api_key_tenant(raw_key: str) -> Optional[str]:
+    """Resolve a persistent, DB-issued API key (POST /auth/api-key) to its
+    owner's tenant_id. Any failure (Postgres unreachable, etc.) is treated as
+    'not a valid key' rather than a hard error — this is one of several
+    things a bearer value could be, not the only one."""
+    try:
+        with get_cursor() as cur:
+            cur.execute(
+                """SELECT u.tenant_id FROM app.api_keys k
+                   JOIN app.users u ON u.id = k.user_id
+                   WHERE k.key_hash = %s""",
+                (_hash_key(raw_key),),
+            )
+            row = cur.fetchone()
+        return row["tenant_id"] if row else None
+    except Exception:
+        return None
+
+
+def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Security(security_scheme)) -> str:
+    """Accepts three kinds of bearer value, in order, all resolving to a
+    tenant_id — callers (app.main's endpoints, or any other service in this
+    repo, e.g. rag_harness) don't need to know which kind was used:
+      1. A static, pre-shared API_TOKENS entry — tenant_id is the token itself.
+      2. A JWT issued by /auth/login or /auth/register — tenant_id comes from
+         the JWT's own claim.
+      3. A persistent, DB-issued API key (POST /auth/api-key) — only
+         attempted for values shaped like one (see _generate_api_key) so a
+         plain invalid token never triggers a Postgres round-trip.
+    """
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication scheme. Use Bearer token.",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    token = credentials.credentials
+
+    if token in VALID_TOKENS:
+        return token
+
+    payload = decode_jwt(token)
+    if payload is not None:
+        return payload["tenant_id"]
+
+    if token.startswith("sk_"):
+        tenant_id = _lookup_api_key_tenant(token)
+        if tenant_id is not None:
+            return tenant_id
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Invalid or missing API token."
+    )
 
 
 def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Security(_security)) -> dict:

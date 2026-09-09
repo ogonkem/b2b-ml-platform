@@ -7,7 +7,7 @@ celery_app = Celery(
     "b2b_ml_platform",
     broker=f"{REDIS_URL}/2",
     backend=f"{REDIS_URL}/3",
-    include=["celery_worker.tasks"],
+    include=["celery_worker.tasks", "rag_harness.ingest_task"],
 )
 
 celery_app.conf.update(

@@ -3,7 +3,12 @@ services:
   # ── Core Storage (PostgreSQL) ─────────────────────────────────────────────
   # Airflow metadata DB + application relational data
   postgres:
-    image: postgres:15-alpine
+    # pgvector/pgvector:pg15 is a drop-in build of the same postgres:15 —
+    # same major version, same on-disk data format — with the pgvector
+    # extension included. Needed for rag.doc_chunks' embedding VECTOR(1536)
+    # column and ivfflat index (rag_harness/db.py); app.* and Airflow's own
+    # tables are unaffected.
+    image: pgvector/pgvector:pg15
     container_name: data-postgres
     env_file:
       - .env
@@ -215,8 +220,93 @@ services:
     networks:
       - backend-network
 
+  # ── RAG Ingestion Harness (FastAPI) ───────────────────────────────────────
+  # Document ingestion/retrieval harness for RAG pipelines. Shares the main
+  # stack's Postgres (schema `rag`) and MinIO (bucket `doc-chunks-raw`)
+  # rather than provisioning its own instances. Reuses app.auth.verify_token
+  # directly, so any bearer value that already authenticates against the api
+  # service works here too.
+  # Swagger docs → http://localhost:8001/docs
+  rag_harness:
+    build:
+      context: .
+      dockerfile: Dockerfile.rag_harness
+    container_name: selastone-rag-harness
+    env_file:
+      - .env
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - backend-network
+    healthcheck:
+      # curl isn't installed in this image (python:3.12-slim) — a missing
+      # binary makes the healthcheck command itself fail, reporting
+      # "unhealthy" regardless of whether the service is actually up.
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8001/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Rule Engine (FastAPI) ──────────────────────────────────────────────────
+  # Deterministic, code-only loan decisioning (rule_engine/engine.py) — no
+  # database, no object storage, no LLM/external API calls beyond reading
+  # rule_engine/thresholds.py. Its own service, not part of rag_harness, so
+  # this audit-critical path never depends on Postgres/MinIO/Redis/Celery/
+  # OpenAI being healthy (see rule_engine/main.py for the full tradeoff).
+  # Reuses app.auth.verify_token directly, same as rag_harness.
+  # Swagger docs → http://localhost:8002/docs
+  rule_engine:
+    build:
+      context: .
+      dockerfile: Dockerfile.rule_engine
+    container_name: selastone-rule-engine
+    env_file:
+      - .env
+    ports:
+      - "8002:8002"
+    networks:
+      - backend-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8002/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Decision Agent (FastAPI + LangGraph) ──────────────────────────────────
+  # POST /v1/agent/assess — fixed-order orchestration (predict -> build
+  # retrieval query -> retrieve policy -> rule-based decide -> LLM narrative
+  # -> audit) across the api, rag_harness, and rule_engine services. Own
+  # Postgres schema (`agent`) for the audit trail (agent.agent_decisions);
+  # no other storage of its own.
+  # Swagger docs → http://localhost:8003/docs
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    container_name: selastone-agent
+    env_file:
+      - .env
+    ports:
+      - "8003:8003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8003/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
   # ── Frontend (React + Vite, served via nginx) ─────────────────────────────
   # JWT login/register + dashboard/predict/batch/labeled-data/usage/admin UI
+  # + agent assessment/policy-document pages (call agent/rag_harness directly)
   # UI → http://localhost:3001
   frontend:
     build:
@@ -224,11 +314,15 @@ services:
       dockerfile: Dockerfile.frontend
       args:
         VITE_API_BASE_URL: http://localhost:8000
+        VITE_AGENT_BASE_URL: http://localhost:8003
+        VITE_RAG_HARNESS_BASE_URL: http://localhost:8001
     container_name: selastone-frontend
     ports:
       - "3001:80"
     depends_on:
       - api
+      - agent
+      - rag_harness
     networks:
       - backend-network
 

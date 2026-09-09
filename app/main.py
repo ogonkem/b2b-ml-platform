@@ -39,7 +39,6 @@ app = FastAPI(
     version="1.3.0",
     description="Production API endpoint for processing dynamic loan configurations and calculating risk defaults."
 )
-security_scheme = HTTPBearer(auto_error=False)
 
 # No browser client existed before the frontend/ SPA — CORS was never
 # needed until now. FRONTEND_ORIGINS is a comma-separated list so both the
@@ -64,7 +63,13 @@ async def no_store_cache(request, call_next):
     response.headers["Cache-Control"] = "no-store"
     return response
 
-from app.auth import router as auth_router, require_admin, get_current_user
+from app.auth import (
+    router as auth_router,
+    require_admin,
+    get_current_user,
+    security_scheme,
+    verify_token,
+)
 app.include_router(auth_router)
 
 # -------------------------------------------------------------------------
@@ -100,68 +105,10 @@ app.mount("/metrics", metrics_app)
 # -------------------------------------------------------------------------
 # AUTHENTICATION
 # -------------------------------------------------------------------------
-
-VALID_TOKENS = set(os.environ.get("API_TOKENS", "dev-token").split(","))
-
-def _lookup_api_key_tenant(raw_key: str) -> Optional[str]:
-    """Resolve a persistent, DB-issued API key (POST /auth/api-key) to its
-    owner's tenant_id. Any failure (Postgres unreachable, etc.) is treated as
-    'not a valid key' rather than a hard error — this is one of several
-    things a bearer value could be, not the only one."""
-    from app.auth import _hash_key
-    from app.db import get_cursor
-    try:
-        with get_cursor() as cur:
-            cur.execute(
-                """SELECT u.tenant_id FROM app.api_keys k
-                   JOIN app.users u ON u.id = k.user_id
-                   WHERE k.key_hash = %s""",
-                (_hash_key(raw_key),),
-            )
-            row = cur.fetchone()
-        return row["tenant_id"] if row else None
-    except Exception:
-        return None
-
-
-def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Security(security_scheme)):
-    """Accepts three kinds of bearer value, in order, all resolving to a
-    tenant_id exactly as before — /v1/predict etc. don't need to know which
-    kind was used:
-      1. A static, pre-shared API_TOKENS entry (unchanged) — tenant_id is
-         the token itself.
-      2. A JWT issued by /auth/login or /auth/register (app/auth.py) —
-         tenant_id comes from the JWT's own claim.
-      3. A persistent, DB-issued API key (POST /auth/api-key) — only
-         attempted for values shaped like one (see app.auth._generate_api_key)
-         so a plain invalid token never triggers a Postgres round-trip.
-    """
-    if credentials is None or credentials.scheme.lower() != "bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication scheme. Use Bearer token.",
-            headers={"WWW-Authenticate": "Bearer"}
-        )
-    token = credentials.credentials
-
-    if token in VALID_TOKENS:
-        return token
-
-    from app.auth import decode_jwt
-    payload = decode_jwt(token)
-    if payload is not None:
-        return payload["tenant_id"]
-
-    if token.startswith("sk_"):
-        tenant_id = _lookup_api_key_tenant(token)
-        if tenant_id is not None:
-            return tenant_id
-
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="Invalid or missing API token."
-    )
-
+# security_scheme, VALID_TOKENS, and verify_token now live in app.auth (see
+# import above) — shared as-is with any other service in this repo that
+# needs to resolve the same bearer value to the same tenant_id, e.g.
+# rag_harness, without duplicating the three-way static/JWT/api-key logic.
 
 # -------------------------------------------------------------------------
 # PYDANTIC SCHEMAS
@@ -255,6 +202,48 @@ else:
 
     print("⚠️  Running in development mode — using mock model and pipeline")
     print("   Set USE_REAL_ARTEFACTS=true (or in .env) to load real artefacts")
+
+# ── SHAP explainability (agent/graph.py's build_retrieval_query node reads
+# the top factor from this) ────────────────────────────────────────────────
+_shap_explainer_cache: Dict[int, Any] = {}
+SHAP_TOP_N_FACTORS = 8
+
+
+def _get_shap_explainer(model):
+    """Cached by the model object's identity — shap.Explainer construction
+    has a fixed cost worth avoiding on every single request. Only one
+    model is ever live at a time, so the cache never needs more than one
+    entry; a hot-swap via ModelManager naturally invalidates the old one
+    since the new model object has a different id()."""
+    import shap
+    key = id(model)
+    if key not in _shap_explainer_cache:
+        _shap_explainer_cache.clear()
+        _shap_explainer_cache[key] = shap.Explainer(model)
+    return _shap_explainer_cache[key]
+
+
+def _compute_shap_factors(model, transformed_features):
+    """Top SHAP_TOP_N_FACTORS features by absolute contribution to this
+    prediction, most impactful first. Never raises — a SHAP failure
+    degrades to an empty list rather than failing the whole prediction,
+    same as this endpoint's other non-critical enrichments (ClickHouse
+    logging)."""
+    try:
+        explainer = _get_shap_explainer(model)
+        values = explainer(transformed_features).values[0]
+        if hasattr(values, "ndim") and values.ndim > 1:
+            values = values[:, -1]   # positive-class contribution, if a class axis is present
+        pairs = sorted(
+            zip(feature_pipeline.feature_names, (float(v) for v in values)),
+            key=lambda pair: abs(pair[1]),
+            reverse=True,
+        )
+        return [{"feature": name, "value": round(value, 4)} for name, value in pairs[:SHAP_TOP_N_FACTORS]]
+    except Exception as e:
+        print(f"[WARNING] SHAP computation failed: {e}")
+        return []
+
 
 # ── ModelManager — start AFTER model is loaded ────────────────────────────
 # Only polls MLflow when real artefacts are in use
@@ -467,13 +456,17 @@ async def predict_default(
         # promotion — ModelManager's poll loop would update model_manager.version
         # (visible on /health) but never actually reach a live request.
         if model_manager is not None and model_manager.is_loaded:
+            active_model  = model_manager.model
             probability   = float(model_manager.predict_proba(transformed_features)[0, 1])
             prediction    = int(model_manager.predict(transformed_features)[0])
             model_version = str(model_manager.version)
         else:
+            active_model  = pred_model
             probability   = float(pred_model.predict_proba(transformed_features)[0, 1])
             prediction    = int(pred_model.predict(transformed_features)[0])
             model_version = "dev"
+
+        shap_factors = _compute_shap_factors(active_model, transformed_features)
 
         # RECORD LATENCY and INCREMENT COUNTER
         PREDICTION_LATENCY.observe(time.time() - start) 
@@ -498,6 +491,14 @@ async def predict_default(
             "application_id": payload.ID,
             "default_prediction": prediction,
             "default_probability": round(probability, 4),
+            # 0-100 scale — rule_engine/thresholds.py's risk bands were
+            # authored on a 0-100 scale, not the raw 0-1 probability.
+            "risk_score": round(probability * 100, 2),
+            "shap_factors": shap_factors,
+            # Already computed above for ClickHouse logging — also surfaced
+            # here so callers (agent/graph.py's audit trail) can record
+            # exactly which model version produced this risk_score.
+            "model_version": model_version,
             "status": "success"
         }
         

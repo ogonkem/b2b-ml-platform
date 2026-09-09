@@ -1,9 +1,14 @@
 """
 scripts/setup_paystack_plans.py
-One-time setup: creates Paystack Plan objects for Selastone's paid tiers
+Setup: creates Paystack Plan objects for Selastone's paid tiers
 (app/plans.py) and prints the resulting plan codes to paste into .env.
 Run manually from the host with PAYSTACK_SECRET_KEY already set in .env —
 never called by the app itself, never scheduled, never committed output.
+
+Safe to re-run after adding a new tier to CHECKOUT_PLANS: any plan_id whose
+PAYSTACK_PLAN_<ID> env var is already set is skipped, so re-running this
+only ever creates a Plan object for what's actually new — it never
+re-creates a duplicate Paystack Plan for a tier that already has one.
 """
 import os
 import sys
@@ -33,6 +38,11 @@ def main():
 
     results = {}
     for plan_id in CHECKOUT_PLANS:
+        existing_code = os.environ.get(f"PAYSTACK_PLAN_{plan_id.upper()}")
+        if existing_code:
+            print(f"  {PLANS[plan_id]['label']:<12} already has a plan code ({existing_code}) — skipping")
+            continue
+
         details = PLANS[plan_id]
         amount_subunits = usd_to_paystack_subunits(details["price_amount"])
         resp = requests.post(
@@ -55,6 +65,10 @@ def main():
         results[plan_id] = plan_code
         print(f"  {details['label']:<12} (${details['price_amount']}/mo -> {PAYSTACK_CURRENCY} "
               f"{amount_subunits / 100:,.0f}/mo) -> {plan_code}")
+
+    if not results:
+        print("\nNothing new to add — every checkout plan already has a code configured.")
+        return
 
     print("\nAdd these to .env:\n")
     for plan_id, code in results.items():
