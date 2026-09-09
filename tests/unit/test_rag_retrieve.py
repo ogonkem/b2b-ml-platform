@@ -245,6 +245,81 @@ class TestRetrieveTenantIsolation:
         assert cursor._result == []
 
 
+class RecordingCursor:
+    """Captures every raw (query, params) pair passed to execute() —
+    unlike FakeCursor, this doesn't simulate row filtering at all. Used to
+    inspect the actual SQL/parameter structure the endpoint builds, not
+    just its behavior: proving tenant_id is a genuine bound WHERE-clause
+    parameter on both underlying queries, positioned before ORDER BY/LIMIT,
+    never a post-filter and never interpolated into the query text."""
+
+    def __init__(self):
+        self.calls = []
+
+    def execute(self, query, params=None):
+        self.calls.append((" ".join(query.split()), params or ()))
+
+    def fetchall(self):
+        return []
+
+    def fetchone(self):
+        return None
+
+
+class TestRetrieveQueryStructure:
+
+    def test_tenant_id_is_a_bound_where_clause_parameter_on_both_queries(self):
+        cursor = RecordingCursor()
+        p1, p2 = _patched(cursor)
+        with p1, p2:
+            resp = client.post(
+                "/v1/retrieve",
+                json={"tenant_id": TENANT_A, "query": "debt to income ratio"},
+                headers={"Authorization": f"Bearer {TENANT_A}"},
+            )
+        assert resp.status_code == 200
+
+        # Exactly two queries: the vector-similarity query and the
+        # full-text query — both against rag.doc_chunks.
+        assert len(cursor.calls) == 2
+
+        for query, params in cursor.calls:
+            upper = query.upper()
+            assert "WHERE" in upper and "ORDER BY" in upper
+            where_idx = upper.index("WHERE")
+            order_idx = upper.index("ORDER BY")
+            tenant_idx = upper.index("TENANT_ID")
+            # tenant_id must be part of the WHERE clause, evaluated before
+            # any ranking/ordering — never a post-filter on already-ranked
+            # results.
+            assert where_idx < tenant_idx < order_idx
+
+            # The actual value must arrive as a bound parameter, not
+            # string-interpolated into the SQL text — %s placeholders stay
+            # literal in the query string, and the real tenant_id shows up
+            # only in the params tuple.
+            assert "%s" in query
+            assert TENANT_A not in query
+            assert params[0] == TENANT_A
+
+    def test_effective_to_is_null_is_also_in_both_where_clauses(self):
+        """The other half of tenant isolation: a superseded chunk must be
+        excluded at the same WHERE-clause stage, not filtered out after
+        the fact either."""
+        cursor = RecordingCursor()
+        p1, p2 = _patched(cursor)
+        with p1, p2:
+            client.post(
+                "/v1/retrieve",
+                json={"tenant_id": TENANT_A, "query": "anything"},
+                headers={"Authorization": f"Bearer {TENANT_A}"},
+            )
+        for query, _params in cursor.calls:
+            upper = query.upper()
+            assert "EFFECTIVE_TO IS NULL" in upper
+            assert upper.index("WHERE") < upper.index("EFFECTIVE_TO IS NULL") < upper.index("ORDER BY")
+
+
 class TestRetrieveResponseShape:
 
     def test_response_includes_expected_fields(self):
