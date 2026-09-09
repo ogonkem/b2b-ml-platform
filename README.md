@@ -2,10 +2,11 @@
 
 A self-contained machine learning platform for credit risk scoring built entirely on open-source tooling. The full stack — API, workers, model registry, scheduler, and observability — runs on a single laptop with Docker Compose.
 
-Two workloads are supported:
+Three workloads are supported:
 
 - **Real-time scoring** — authenticated REST requests return a default probability in under 300 ms
 - **Bulk batch scoring** — CSV files of any size are queued asynchronously, scored in the background, and made available via a presigned download link
+- **Agentic, policy-grounded decisioning** — a LangGraph orchestrator combines the statistical risk score with a tenant's own lending policy documents (retrieved via a hybrid vector + full-text search) and a deterministic rule engine, producing an approve/refer/reject decision with an LLM-written explanation that cites both the SHAP factors and the specific policy clause behind it ([§12](#12-agentic-policy-grounded-loan-decisioning))
 
 An automated MLOps loop keeps the model current: tenants upload labeled outcomes, a daily job collects them into DVC unconditionally, and a weekly pipeline checks that data for drift, retrains, and promotes a new model if the challenger beats the incumbent by a meaningful margin.
 
@@ -24,8 +25,9 @@ An automated MLOps loop keeps the model current: tenants upload labeled outcomes
 9. [Observability](#9-observability)
 10. [Holdout lifecycle testing](#10-holdout-lifecycle-testing)
 11. [Frontend and multi-user accounts](#11-frontend-and-multi-user-accounts)
-12. [Running locally](#running-locally)
-13. [Repository layout](#repository-layout)
+12. [Agentic, policy-grounded loan decisioning](#12-agentic-policy-grounded-loan-decisioning)
+13. [Running locally](#running-locally)
+14. [Repository layout](#repository-layout)
 
 ---
 
@@ -59,6 +61,7 @@ MinIO is an S3-compatible object store that runs in a container. It holds four b
 | `batch-results` | Scored CSVs ready for tenant download |
 | `labeled-data` | Tenant-uploaded ground truth for drift detection and retraining |
 | `mlflow-artifacts` | Serialised models and run metadata written by MLflow |
+| `doc-chunks-raw` | Original uploaded policy documents (PDF/DOCX/MD/TXT), used by [§12](#12-agentic-policy-grounded-loan-decisioning)'s RAG pipeline |
 
 When a batch job completes, the API generates a presigned URL — the tenant downloads the results file directly from MinIO without the API acting as a proxy. This keeps the API stateless and removes a large data transfer from its critical path.
 
@@ -368,14 +371,17 @@ Four read endpoints back the UI, all resolving `tenant_id` through the same unif
 
 Each tenant has a `plan` (`app.tenants.plan`, defaulting to `free`) that determines its monthly quota — the catalog lives in `app/plans.py`, not the database, so tiers are a code change, not a migration:
 
-| Plan | Monthly quota | Price |
-|---|---|---|
-| Free | 100 | $0/mo |
-| Starter | 1,000 | $49/mo |
-| Pro | 5,000 | $199/mo |
-| Enterprise | 25,000 | Contact us |
+| Plan | Monthly prediction quota | RAG ingestion / retrieval quota | Price |
+|---|---|---|---|
+| Free | 100 | 5 / 50 | $0/mo |
+| Starter | 1,000 | 50 / 1,000 | $49/mo |
+| Pro | 5,000 | 250 / 5,000 | $199/mo |
+| Agent | 10,000 | 500 / 10,000 | $349/mo |
+| Enterprise | 25,000 | 2,000 / 50,000 | Contact us |
 
-`GET /v1/plans` lists the catalog. Switching to `free` is an instant, self-service `POST /v1/tenant/plan` — a static `API_TOKENS` value has no `app.tenants` row to update and gets a clear rejection pointing at `/auth/register` instead of a silent no-op; it stays on the `free` limit exactly like before this feature existed. Starter and Pro have a real fixed USD price and are billed through Paystack instead (below); Enterprise has no fixed price (`price_amount: None` in `app/plans.py`) and is sales-assisted, never sold through checkout. The frontend's `/plans` page renders the catalog as tier cards; `/usage` shows the active plan next to the quota bar.
+`GET /v1/plans` lists the catalog. Switching to `free` is an instant, self-service `POST /v1/tenant/plan` — a static `API_TOKENS` value has no `app.tenants` row to update and gets a clear rejection pointing at `/auth/register` instead of a silent no-op; it stays on the `free` limit exactly like before this feature existed. Starter, Pro, and Agent have a real fixed USD price and are billed through Paystack instead (below); Enterprise has no fixed price (`price_amount: None` in `app/plans.py`) and is sales-assisted, never sold through checkout. The frontend's `/plans` page renders the catalog as tier cards; `/usage` shows the active plan next to the quota bar.
+
+Every tier also carries a bundled `rag_ingestion_quota`/`rag_retrieval_quota` — see [§12](#12-agentic-policy-grounded-loan-decisioning) — and the **Agent** tier's one price is what actually unlocks `POST /v1/agent/assess`: there's no separate "agent calls/mo" counter, since each assessment already consumes one prediction plus whatever retrieval it performs, both metered through the counters those two services already enforce on their own.
 
 ### Billing (Paystack)
 
@@ -386,7 +392,7 @@ Starter and Pro are real, paid subscriptions — collected through Paystack's ho
 - **`GET /v1/tenant/billing-portal`** — returns a Paystack-hosted subscription-management link (`/subscription/{code}/manage/link`) where a tenant can update their card or cancel; the closest equivalent Paystack has to a full billing portal.
 - **The cancel guard**: `POST /v1/tenant/plan` refuses a direct switch to `free` while `subscription_status = active` — without it, a tenant could downgrade their quota entitlement locally while Paystack keeps billing them for the paid plan. Cancelling has to go through the billing portal; the webhook is what actually flips the tenant back to `free` once that cancellation lands.
 
-**One-time setup** — `scripts/setup_paystack_plans.py` reads `app/plans.py`'s paid tiers and creates matching Paystack Plan objects via their API (skipping `free` and `enterprise`), printing the resulting plan codes to paste into `.env` as `PAYSTACK_PLAN_STARTER` / `PAYSTACK_PLAN_PRO`. Run it once after setting `PAYSTACK_SECRET_KEY` and `PAYSTACK_CURRENCY`.
+**One-time setup** — `scripts/setup_paystack_plans.py` reads `app/plans.py`'s paid tiers and creates matching Paystack Plan objects via their API (skipping `free` and `enterprise`), printing the resulting plan codes to paste into `.env` as `PAYSTACK_PLAN_STARTER` / `PAYSTACK_PLAN_PRO` / `PAYSTACK_PLAN_AGENT`. Run it once after setting `PAYSTACK_SECRET_KEY` and `PAYSTACK_CURRENCY` — it's idempotent, skipping any `plan_id` whose `PAYSTACK_PLAN_<ID>` env var is already set, so re-running it after adding a new tier (like `agent`) only ever creates a Plan object for what's actually new.
 
 **Testing locally**: the automated test suite (`tests/unit/test_payments.py`) mocks every Paystack call — no real key or network needed. To see a real webhook fire end-to-end, tunnel the local API (not the frontend) with something like `ngrok http 8000` and register `<tunnel-url>/webhooks/paystack` specifically as the **webhook** URL in Paystack's dashboard — the separate "callback URL" field there is unrelated to ours (we always pass our own `callback_url` per-request) and doesn't need tunneling, since it's just the customer's own browser redirecting, which can already reach `localhost` directly. Then complete a checkout using Paystack's test-mode payment simulator (its hosted checkout page offers one-click "Success" / "Bank Authentication" / "Declined" options — no real card number needed). One gotcha: Paystack's `callback_url` redirect goes to the *first* entry in `FRONTEND_ORIGINS` — if you started checkout from a different origin (e.g. the Vite dev server on `:5173` vs. the Docker/nginx build on `:3001`), you'll land back on a different origin than you logged in on, and since `localStorage` is per-origin, the app will look logged out there even though the webhook itself processed correctly. Navigate back to the origin you actually logged in on to see the updated plan.
 
@@ -399,6 +405,79 @@ The `/api-docs` page in the frontend is a curated reference for anyone integrati
 React + Vite + TypeScript, `react-router-dom` for routing, an `AuthContext` holding the JWT (persisted to `localStorage`) and current user, and a thin `fetch` wrapper that attaches `Authorization: Bearer <jwt>` and redirects to `/login` on a 401. `RequireAuth`/`RequireAdmin` route guards enforce the same access rules client-side that the backend already enforces server-side.
 
 Served in production via `Dockerfile.frontend` — a multi-stage build (Node build, then static files served by nginx, with an SPA fallback so deep links like `/dashboard` don't 404 on refresh). CORS is opened for the frontend's origin via `CORSMiddleware` (`FRONTEND_ORIGINS` env var).
+
+---
+
+## 12. Agentic, policy-grounded loan decisioning
+
+**`rag_harness/` (port 8001) + `rule_engine/` (port 8002) + `agent/` (port 8003)**
+
+On top of the statistical risk score from [§6](#6-prediction-api), a tenant can ask for a *decision* — an approve/refer/reject outcome that cites both the SHAP factors behind the score and the specific clause of the tenant's own lending policy that applies, with a plain-language explanation of both. Three new services do this, each independently deployable but sharing all of the existing infrastructure — same Postgres instance (new `rag`/`agent` schemas), same MinIO instance (new `doc-chunks-raw` bucket), same Redis instance and Celery app, same `app.auth.verify_token()` — nothing here spins up parallel infra or reimplements auth.
+
+### rag_harness — document ingestion and hybrid retrieval
+
+**Ingestion (`rag_harness/ingest_task.py`)** runs as a Celery task on the existing `celery_worker` (registered in `celery_worker/celery_app.py`'s `include` list, not a separate Celery instance). `POST /v1/documents` uploads a policy document (PDF/DOCX/MD/TXT), enqueues the task, and returns immediately — the same fire-and-poll pattern as [batch scoring](#7-async-batch-pipeline). The pipeline:
+
+1. Upload the original file to MinIO at `{tenant_id}/{doc_id}/{version}/original.{ext}`
+2. Extract text — `pdfplumber` for PDF, `python-docx` for DOCX, passthrough for MD/TXT
+3. **Structure-aware chunking** — detect numbered clauses (`4.2.1`), markdown headers, or `SECTION N` headings, and split on those boundaries so a chunk lines up with a real policy clause rather than an arbitrary character offset. A document with fewer than 3 detected boundaries that's clearly more than one page (real page count for PDFs, a word-count heuristic otherwise) falls back to plain paragraph splitting instead — a stray number or one header in an otherwise unstructured document isn't a reliable enough signal to chunk on, and forcing it would silently attach a wrong-looking `section_ref` to unrelated text
+4. Enforce a 400-token max / 50-token min band per chunk (`tiktoken`'s `cl100k_base` encoding) — recursively splitting on paragraph → line → sentence → word boundaries for anything too long, merging anything too short into a neighbor
+5. Embed each chunk (OpenAI `text-embedding-3-small`, 1536-dim — chosen to match `rag.doc_chunks.embedding VECTOR(1536)` exactly, with no padding/truncation) and sha256 each chunk's text
+6. On re-ingestion of the same `doc_id`, diff by chunk hash against the version being superseded — only new/changed chunks get re-embedded, unchanged ones reuse their previous embedding verbatim — then mark the old version's rows `effective_to = now()` and insert the new version's rows
+
+This is the one real network dependency and per-token cost in an otherwise fully local stack — ingestion (and retrieval, below) fails closed without a real `OPENAI_API_KEY`. It mirrors the platform's one other external-API dependency (Paystack billing, [§11](#11-frontend-and-multi-user-accounts)), so it isn't unprecedented, but it's a genuine deviation from "runs entirely on one machine." A local `sentence-transformers` model would avoid it, but no commonly used pretrained model emits 1536-dim vectors natively — swapping `_embed_batch()` for one later is a contained change if the network dependency becomes a problem.
+
+**Retrieval — `POST /v1/retrieve`** runs two ranked queries against `rag.doc_chunks` — pgvector cosine similarity (`embedding <=> query_vector`, top 20) and Postgres full-text (`plainto_tsquery` against a generated `tsvector` column, GIN-indexed, top 20) — and merges them with **Reciprocal Rank Fusion** (`score = Σ 1/(60 + rank)` across whichever lists a chunk appears in). Hybrid search this way catches both semantic paraphrase matches the keyword search would miss and exact-term matches (a specific rate or clause number) the embedding might rank lower.
+
+**Tenant isolation is a hard `WHERE tenant_id = %s` clause in both underlying queries, evaluated before `ORDER BY`/`LIMIT` — never a filter applied to the merged result afterward.** A chunk belonging to another tenant, no matter how close a semantic or lexical match, never enters either candidate list in the first place, so RRF has nothing of theirs to rank. This is proven two ways: a unit test that inspects the actual SQL/params passed to the DB layer (`tests/unit/test_rag_retrieve.py`), and a live integration test (`tests/integration/test_rag_harness.py`) that ingests two tenants' real documents and queries as one tenant with text deliberately closer to the *other* tenant's content, asserting zero of that tenant's chunks come back.
+
+**Quotas** mirror `app.main.check_and_increment_quota`'s exact pattern (check-before-increment, atomic `INCRBY`, ~32-day TTL) under their own Redis key prefixes (`rag_ingest_quota:`/`rag_retrieve_quota:`, deliberately distinct from `quota:` so the two services' counters for the same tenant never collide in the same Redis instance) — `rag_ingestion_quota` counts documents ingested, `rag_retrieval_quota` counts `/v1/retrieve` calls, both read from the tenant's existing plan (`app/plans.py`, no separate RAG billing). `GET /v1/usage` reports both nested, same shape philosophy as `app.main`'s own usage endpoint.
+
+### rule_engine — deterministic, auditable decisioning
+
+`rule_engine/thresholds.py` holds a per-tenant threshold configuration (`TENANT_THRESHOLDS`) as a Python dict, not a database table — same reasoning as `app/plans.py`: it changes rarely, is reviewed like code, and every number needs to trace to a specific commit for audit purposes. Three demo tenants illustrate three different real-world shapes a lending policy can take:
+
+| Tenant | Shape |
+|---|---|
+| `commercial_bank` | DTI soft/hard caps + a four-band risk classification (`approve` → `refer` → `refer` → `reject`) |
+| `microfinance_sacco` | DTI caps + a single review threshold, no full band structure — anything under it approves by default |
+| `informal_digital_lender` | No DTI concept at all — pure risk-score bands, automated scoring only, no `refer` outcome exists in this tenant's policy |
+
+`POST /v1/decide` is pure Python — zero I/O, fully deterministic given its inputs — and resolves conflicts when more than one rule fires by taking the single most severe outcome (`DECISION_SEVERITY`: approve < refer < reject), regardless of evaluation order. An unrecognized `tenant_id` raises rather than silently guessing at a policy (`UnknownTenantError`). A separate `FALLBACK_RISK_BANDS` — generic, tenant-agnostic, risk-score-only, no caps — exists for exactly one caller: `agent/graph.py` passes `use_fallback=True` when retrieval found zero policy chunks to ground a tenant-specific decision in, so the response is honestly generic rather than pretending to be policy-grounded when it isn't.
+
+### agent — the LangGraph orchestrator
+
+`POST /v1/agent/assess` runs a fixed, six-node pipeline (`agent/graph.py`) — this is a loan-decisioning workflow, not an agent choosing its own steps, so there is exactly one path through the graph every time:
+
+```
+predict → build_retrieval_query → retrieve → decide → synthesize → audit
+```
+
+1. **predict** — calls Selastone's own `POST /v1/predict` ([§6](#6-prediction-api)) over real HTTP (this service is its own deployment, not in-process with `app`), getting back `risk_score` and the SHAP-explained `shap_factors`
+2. **build_retrieval_query** — pure Python, no I/O: turns the top SHAP factor plus the loan type into a natural-language query (e.g. `debt_to_income` + `real_estate_payment_plan` → *"debt to income ratio threshold real estate payment plan"*), via a small alias table for the raw feature names `shared/features.py`'s `FeaturePipeline` actually produces (`dtir1`, `loan_to_property`, …)
+3. **retrieve** — calls rag_harness's `POST /v1/retrieve`, tenant-scoped, top 5 chunks
+4. **decide** — calls rule_engine's `POST /v1/decide`; if step 3 returned zero chunks, this step is told to use `FALLBACK_RISK_BANDS` instead of this tenant's real policy, and the response is marked `policy_aligned: false` rather than skipped outright — a decision still gets made, just not one grounded in retrieved policy text
+5. **synthesize** — the only LLM call (`gpt-4o-mini`, chosen for cost since the prompt is heavily grounded already) — explicitly instructed to cite the statistical factors *and* the specific retrieved clause/section, quote threshold values verbatim from what was actually triggered, and never invent a number or policy detail not present in the prompt's own grounding data
+6. **audit** — writes the full trace to `agent.agent_decisions`
+
+The response — `{decision, risk_score, statistical_factors, policy_basis, policy_chunks, narrative, policy_aligned}` — separates *why the model thinks this* (`statistical_factors`, SHAP) from *why the policy says this* (`policy_basis`, the triggered rule/threshold objects) from *what the policy actually says* (`policy_chunks`, the retrieved text with `section_ref`), so a reviewer can check each independently rather than trusting the narrative's summary of them.
+
+**`agent.agent_decisions`** (idempotent DDL, `agent/db.py`) is the full audit row per assessment: `tenant_id`, `application_ref` (echoed from `/v1/predict`'s `application_id`), `risk_score`, `model_version`, `rule_engine_version`, `decision`, `triggered_thresholds` (JSONB), `retrieved_chunk_ids` (`UUID[]` — just the ids, not the chunk text, so it can never drift out of sync with `rag.doc_chunks` on a re-ingest), `policy_doc_version` (the top-ranked retrieved chunk's version, `NULL` when nothing was retrieved), `policy_aligned`, and `llm_narrative`. `GET /v1/agent/decisions/{application_ref}` returns every decision ever made for that application (newest first — a reassessment doesn't hide the history), and `GET /v1/agent/decisions?tenant_id=&policy_doc_version=` supports "show every decision made under policy version Y" for compliance review after a policy update.
+
+**Testing**: `tests/unit/test_agent_graph.py` mocks all four upstream calls and asserts fixed node order plus the zero-chunks-retrieved fallback path; `tests/integration/test_agent_assess.py` runs the real graph end-to-end against the real `rule_engine.decide()` function per demo tenant with a synthetic high-risk applicant, checking the decision, the policy citations, and the `agent.agent_decisions` row all landed correctly — gated behind a real `OPENAI_API_KEY` like the rag_harness integration tests above it, since every assessment ends in a real LLM synthesis call.
+
+### Frontend
+
+Two pages consume all three services, matching the existing app's conventions exactly (same `AuthContext`, same `apiFetch` wrapper, same route-guard style):
+
+- **`/agent/assess`** — submit a loan application, see the decision, narrative, and cited policy clauses (with `section_ref`) laid out next to the statistical factors that drove the score
+- **`/policies`** — upload and list a tenant's policy documents, poll ingestion status (same polling pattern as the batch job status page), and see current RAG ingestion/retrieval quota usage from `GET /v1/usage`
+
+### Infrastructure notes
+
+- Postgres runs `pgvector/pgvector:pg15` instead of vanilla `postgres:15-alpine` — a drop-in, same-on-disk-format swap needed for the `VECTOR(1536)` column type and its `ivfflat` cosine index.
+- `rag_harness`, `rule_engine`, and `agent` each build from their own `Dockerfile.*`, each also copying in `app/` so they can import `app.auth.verify_token()` without reimplementing it.
+- `agent/clients.py` calls the other two services over real HTTP using in-cluster docker-compose hostnames (`SELASTONE_API_URL`, `RAG_HARNESS_URL`, `RULE_ENGINE_URL`) — everything here is its own deployment, unlike `ModelManager`'s in-process model swap in [§6](#6-prediction-api).
 
 ---
 
@@ -425,9 +504,11 @@ docker run --rm \
   sh -c "pip install -q imbalanced-learn && python notebooks/retrain.py"
 
 # 3. Run the integration test suite
-pip install mlflow httpx pytest pytest-asyncio python-dotenv
+pip install mlflow httpx pytest pytest-asyncio python-dotenv minio
 python -m pytest tests/integration/ -v
 ```
+
+Set a real `OPENAI_API_KEY` in `.env` to exercise document ingestion, retrieval, and `POST /v1/agent/assess` ([§12](#12-agentic-policy-grounded-loan-decisioning)) — without it, `rag_harness`/`agent` still start and serve every non-embedding endpoint, and `tests/integration/test_rag_harness.py`/`test_agent_assess.py` skip cleanly instead of failing.
 
 **Service endpoints:**
 
@@ -435,6 +516,9 @@ python -m pytest tests/integration/ -v
 |-------------------------------|---|
 | Frontend (login/dashboard/admin) | http://localhost:3001 |
 | Prediction API + Swagger docs | http://localhost:8000/docs |
+| RAG harness (documents, retrieval) | http://localhost:8001/docs |
+| Rule engine (decisioning)     | http://localhost:8002/docs |
+| Decision agent (`/v1/agent/assess`) | http://localhost:8003/docs |
 | MLflow experiment tracker     | http://localhost:5000      |
 | MinIO console                 | http://localhost:9001      |
 | Airflow scheduler             | http://localhost:8080      |
@@ -455,7 +539,20 @@ python -m pytest tests/integration/ -v
 │   └── model_manager.py     # Polling hot-swap daemon — threading.Lock + MLflow registry
 ├── scripts/
 │   └── setup_paystack_plans.py  # One-time: creates Paystack Plan objects from app/plans.py (see §11)
-├── frontend/                # React + Vite + TS SPA — login/dashboard/predict/batch/usage/admin (see §11)
+├── rag_harness/              # FastAPI (8001): document ingestion + hybrid retrieval (see §12)
+│   ├── main.py                #   /v1/retrieve, /v1/documents, /v1/usage, quota enforcement
+│   ├── ingest_task.py          #   Celery task: extract → chunk → embed → diff-reingest
+│   └── db.py                   #   rag schema: documents, doc_chunks (pgvector + full-text)
+├── rule_engine/               # FastAPI (8002): deterministic per-tenant decisioning (see §12)
+│   ├── main.py                 #   POST /v1/decide
+│   ├── engine.py                #   decide(): threshold/band evaluation, severity resolution
+│   └── thresholds.py            #   TENANT_THRESHOLDS (code, not DB) + FALLBACK_RISK_BANDS
+├── agent/                     # FastAPI (8003): LangGraph orchestrator (see §12)
+│   ├── main.py                  #   POST /v1/agent/assess, GET /v1/agent/decisions*
+│   ├── graph.py                  #   Six-node fixed pipeline: predict→...→audit
+│   ├── clients.py                 #   HTTP calls to app/rag_harness/rule_engine + LLM synthesis
+│   └── db.py                       #   agent schema: agent_decisions (full audit trail)
+├── frontend/                # React + Vite + TS SPA — login/dashboard/predict/batch/usage/admin/agent/policies (see §11, §12)
 ├── shared/
 │   ├── features.py          # FeaturePipeline: fit/transform, imputation, derived features
 │   └── drift.py             # PSI: compute_psi(), check_drift()
@@ -474,9 +571,13 @@ python -m pytest tests/integration/ -v
 ├── lifecycle_tests/         # Real end-to-end stage-by-stage tests against the holdout slices
 ├── tests/
 │   ├── unit/                # Isolated unit tests — all external calls mocked
-│   └── integration/         # Live stack tests: API endpoints, batch pipeline, MLops loop
-├── docker-compose.yml       # 11-service stack on a shared bridge network
+│   └── integration/         # Live stack tests: API endpoints, batch pipeline, MLops loop,
+│                             #   rag_harness ingestion/retrieval/isolation/quota, agent assess (see §12)
+├── docker-compose.yml       # 14-service stack on a shared bridge network
 ├── Dockerfile.api           # Python 3.12-slim — shared image for API and Celery worker
+├── Dockerfile.rag_harness   # rag_harness service image — bundles app/ for auth reuse (see §12)
+├── Dockerfile.rule_engine   # rule_engine service image — pure Python, no ML stack (see §12)
+├── Dockerfile.agent         # agent service image — langgraph + openai, bundles app/ (see §12)
 ├── Dockerfile.airflow       # apache/airflow + git/dvc + the ML stack the DAGs need (see §8)
 ├── Dockerfile.frontend      # Multi-stage: node build → nginx serve (see §11)
 └── requirements.txt         # Runtime deps: fastapi, celery, xgboost, lightgbm, mlflow, psycopg2, PyJWT, bcrypt …
