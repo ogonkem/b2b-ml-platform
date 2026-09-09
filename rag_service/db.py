@@ -107,3 +107,114 @@ def init_schema():
             CREATE INDEX IF NOT EXISTS doc_chunks_chunk_tsv_gin_idx
                 ON rag.doc_chunks USING GIN (chunk_tsv);
         """)
+
+        # Tenant-supplied ground truth for a document, uploaded alongside the
+        # file itself (POST /v1/documents' optional eval_set field) — hash-
+        # diffed and versioned the same way doc_chunks are (see
+        # rag_service/ingest_task.py's chunk_hash diffing), just one level up.
+        # doc_id is deliberately NOT a foreign key: an eval_set can be
+        # inserted for a brand-new doc_id before rag.documents' own row for
+        # it exists yet (that row is created inside the ingest Celery task,
+        # which runs after this table is written to during upload).
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS rag.eval_sets (
+                id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                tenant_id    TEXT NOT NULL,
+                doc_id       UUID NOT NULL,
+                version      TEXT NOT NULL,
+                eval_hash    TEXT NOT NULL,
+                queries      JSONB NOT NULL,
+                uploaded_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS eval_sets_doc_id_idx
+                ON rag.eval_sets (doc_id, uploaded_at DESC);
+        """)
+
+        # One row per eval run (post-ingestion, or from the Re-eval button) —
+        # a quality report, not authoritative state, so also no FK to
+        # rag.documents for the same reason as eval_sets above.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS rag.eval_runs (
+                id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                tenant_id         TEXT NOT NULL,
+                doc_id            UUID NOT NULL,
+                doc_version       TEXT,
+                eval_set_version  TEXT,
+                status            TEXT NOT NULL,
+                metrics           JSONB,
+                lever_snapshot    JSONB,
+                error             TEXT,
+                created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS eval_runs_doc_id_idx
+                ON rag.eval_runs (doc_id, created_at DESC);
+        """)
+
+        # Per-tenant overrides for the pipeline's tunable levers — every
+        # column NULL means "use this service's compiled-in default"
+        # (rag_service/ingest_task.py's MAX_CHUNK_TOKENS etc., rag_service/
+        # main.py's RRF_K/RETRIEVAL_CANDIDATE_LIMIT). A row only needs to
+        # exist once a human has actually adjusted something via the
+        # Re-eval button's lever inputs.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS rag.tenant_pipeline_config (
+                tenant_id              TEXT PRIMARY KEY,
+                max_chunk_tokens       INT,
+                min_chunk_tokens       INT,
+                min_structural_chunks  INT,
+                rrf_k                  INT,
+                candidate_limit        INT,
+                updated_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_by             TEXT
+            );
+        """)
+
+
+def get_tenant_pipeline_config(tenant_id: str, defaults: dict) -> dict:
+    """Merges `defaults` (the caller's own compiled-in constants) with
+    whatever non-NULL overrides this tenant has set. Degrades to `defaults`
+    on ANY failure (missing table on a not-yet-migrated install, a DB
+    hiccup, etc.) rather than raising — this is a tuning-knob lookup for an
+    optional quality-of-life feature, never something that should be able
+    to break retrieval itself, same philosophy as app/main.py's SHAP
+    computation degrading to an empty list on failure instead of 500ing the
+    whole prediction."""
+    config = dict(defaults)
+    try:
+        with get_cursor() as cur:
+            cur.execute("SELECT * FROM rag.tenant_pipeline_config WHERE tenant_id = %s", (tenant_id,))
+            row = cur.fetchone()
+        if row:
+            for key in defaults:
+                if row.get(key) is not None:
+                    config[key] = row[key]
+    except Exception:
+        pass
+    return config
+
+
+def upsert_tenant_pipeline_config(tenant_id: str, updated_by: str, **fields) -> dict:
+    """Partial update — only the keys in `fields` with a non-None value are
+    written; everything else on the row (or its NULL/default state, if the
+    row doesn't exist yet) is left alone."""
+    fields = {k: v for k, v in fields.items() if v is not None}
+    if not fields:
+        return get_tenant_pipeline_config(tenant_id, {})
+
+    columns = ", ".join(fields.keys())
+    placeholders = ", ".join(["%s"] * len(fields))
+    conflict_updates = ", ".join(f"{k} = EXCLUDED.{k}" for k in fields)
+
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            f"""INSERT INTO rag.tenant_pipeline_config (tenant_id, {columns}, updated_at, updated_by)
+                VALUES (%s, {placeholders}, now(), %s)
+                ON CONFLICT (tenant_id) DO UPDATE SET {conflict_updates}, updated_at = now(), updated_by = EXCLUDED.updated_by""",
+            (tenant_id, *fields.values(), updated_by),
+        )
+        cur.execute("SELECT * FROM rag.tenant_pipeline_config WHERE tenant_id = %s", (tenant_id,))
+        return cur.fetchone()

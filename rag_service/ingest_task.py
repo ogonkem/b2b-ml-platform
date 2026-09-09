@@ -17,6 +17,16 @@ Pipeline (see ingest_document below for the orchestration):
   6. Diff against the doc_id's previous version by chunk_hash — only embed
      what's new or changed, reuse the previous embedding otherwise
   7. Supersede the previous version's rows and insert the new version's rows
+  8. If the tenant uploaded an eval_set alongside this doc, score it against
+     real retrieval and write a rag.eval_runs report (see run_eval below) —
+     best-effort, never fails the ingestion itself
+
+reevaluate_document is the Re-eval button's task: given a tenant's just-
+adjusted lever inputs (already persisted to rag.tenant_pipeline_config by
+the endpoint that enqueues this), it re-runs steps 2-8 above only if a
+chunking-time lever changed, or just step 8 alone if only a query-time
+lever (RRF_K, candidate_limit) changed — see rag_service/main.py's
+POST /v1/documents/{doc_id}/eval.
 
 Embedding: OpenAI text-embedding-3-small (1536-dim). Chosen specifically to
 match rag.doc_chunks.embedding's VECTOR(1536) column exactly, with no
@@ -39,6 +49,7 @@ the pipeline needs to change.
 import base64
 import hashlib
 import io
+import json
 import os
 import re
 import sys
@@ -49,7 +60,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from celery_worker.celery_app import celery_app
-from rag_service.db import get_cursor
+from rag_service.db import get_cursor, get_tenant_pipeline_config
 
 DOC_CHUNKS_BUCKET = "doc-chunks-raw"
 _SUPPORTED_EXTS   = ("pdf", "docx", "md", "txt")
@@ -75,6 +86,19 @@ MIN_STRUCTURAL_CHUNKS     = 3
 # works. 24h TTL, same as app/main.py's job-status keys.
 INGEST_STATUS_KEY_PREFIX = "ingest_status"
 INGEST_STATUS_TTL_SECONDS = 60 * 60 * 24
+
+# Same status-polling pattern, one level up: a re-eval (triggered by
+# ingest_document automatically, or reevaluate_document via the frontend's
+# Re-eval button) reports its own status independently of ingestion status,
+# since the two can now finish at different times (ingest, then eval).
+EVAL_STATUS_KEY_PREFIX = "eval_status"
+EVAL_STATUS_TTL_SECONDS = 60 * 60 * 24
+
+# Top-k used when scoring eval queries against real retrieval — matches
+# agent/graph.py's TOP_K_RETRIEVAL, since that's the "does this query
+# actually surface the right chunk in practice" scenario an eval is meant
+# to approximate.
+EVAL_TOP_K = 5
 
 _minio_client = None
 _openai_client = None
@@ -105,6 +129,20 @@ def get_ingest_status(doc_id: str) -> dict:
     r = _redis()
     status = r.get(f"{INGEST_STATUS_KEY_PREFIX}:{doc_id}")
     error = r.get(f"{INGEST_STATUS_KEY_PREFIX}:{doc_id}:error")
+    return {"status": status or "unknown", "error": error}
+
+
+def set_eval_status(doc_id: str, status: str, error: Optional[str] = None) -> None:
+    r = _redis()
+    r.set(f"{EVAL_STATUS_KEY_PREFIX}:{doc_id}", status, ex=EVAL_STATUS_TTL_SECONDS)
+    if error is not None:
+        r.set(f"{EVAL_STATUS_KEY_PREFIX}:{doc_id}:error", error, ex=EVAL_STATUS_TTL_SECONDS)
+
+
+def get_eval_status(doc_id: str) -> dict:
+    r = _redis()
+    status = r.get(f"{EVAL_STATUS_KEY_PREFIX}:{doc_id}")
+    error = r.get(f"{EVAL_STATUS_KEY_PREFIX}:{doc_id}:error")
     return {"status": status or "unknown", "error": error}
 
 
@@ -218,19 +256,26 @@ def _fallback_paragraph_chunks(text: str) -> list[Chunk]:
     return [Chunk(text=p, section_ref=None) for p in paragraphs]
 
 
-def structure_aware_chunks(text: str, *, page_count: Optional[int] = None) -> list[Chunk]:
+def structure_aware_chunks(
+    text: str, *, page_count: Optional[int] = None, min_structural_chunks: Optional[int] = None,
+) -> list[Chunk]:
     """Splits `text` on detected section boundaries. Falls back entirely to
     paragraph splitting (section_ref=None throughout) when fewer than
-    MIN_STRUCTURAL_CHUNKS boundaries are found in a multi-page document —
+    min_structural_chunks boundaries are found in a multi-page document —
     a handful of stray numbers or a single header in a long, otherwise
-    unstructured document isn't a reliable enough signal to chunk on."""
+    unstructured document isn't a reliable enough signal to chunk on.
+    min_structural_chunks defaults to the module constant, overridable per
+    tenant via rag.tenant_pipeline_config (see _run_ingestion)."""
+    if min_structural_chunks is None:
+        min_structural_chunks = MIN_STRUCTURAL_CHUNKS
+
     lines = text.splitlines()
     boundaries = _detect_section_boundaries(lines)
 
     word_count = len(text.split())
     is_multi_page = (page_count > 1) if page_count is not None else (word_count > MULTI_PAGE_WORD_THRESHOLD)
 
-    if len(boundaries) < MIN_STRUCTURAL_CHUNKS and is_multi_page:
+    if len(boundaries) < min_structural_chunks and is_multi_page:
         return _fallback_paragraph_chunks(text)
 
     if not boundaries:
@@ -299,13 +344,23 @@ def _split_long_text(text: str, max_tokens: int) -> list[str]:
     return [encoding.decode(tokens[i:i + max_tokens]) for i in range(0, len(tokens), max_tokens)]
 
 
-def _enforce_token_bounds(chunks: list[Chunk]) -> list[Chunk]:
+def _enforce_token_bounds(
+    chunks: list[Chunk], *, max_chunk_tokens: Optional[int] = None, min_chunk_tokens: Optional[int] = None,
+) -> list[Chunk]:
+    """max_chunk_tokens/min_chunk_tokens default to the module constants,
+    overridable per tenant via rag.tenant_pipeline_config (see
+    _run_ingestion)."""
+    if max_chunk_tokens is None:
+        max_chunk_tokens = MAX_CHUNK_TOKENS
+    if min_chunk_tokens is None:
+        min_chunk_tokens = MIN_CHUNK_TOKENS
+
     split_chunks: list[Chunk] = []
     for c in chunks:
-        for piece in _split_long_text(c.text, MAX_CHUNK_TOKENS):
+        for piece in _split_long_text(c.text, max_chunk_tokens):
             split_chunks.append(Chunk(text=piece, section_ref=c.section_ref))
 
-    # Merge anything under MIN_CHUNK_TOKENS into a neighbor — forward into
+    # Merge anything under min_chunk_tokens into a neighbor — forward into
     # the next chunk when one exists (the merged chunk keeps the *next*
     # chunk's section_ref, since it ends up holding the larger share of the
     # merged text), otherwise backward into the previous one for a trailing
@@ -314,7 +369,7 @@ def _enforce_token_bounds(chunks: list[Chunk]) -> list[Chunk]:
     i = 0
     while i < len(split_chunks):
         c = split_chunks[i]
-        if len(split_chunks) > 1 and _token_count(c.text) < MIN_CHUNK_TOKENS:
+        if len(split_chunks) > 1 and _token_count(c.text) < min_chunk_tokens:
             if i + 1 < len(split_chunks):
                 nxt = split_chunks[i + 1]
                 split_chunks[i + 1] = Chunk(text=f"{c.text}\n\n{nxt.text}", section_ref=nxt.section_ref)
@@ -336,14 +391,14 @@ def _format_vector(vec: list[float]) -> str:
     return "[" + ",".join(repr(float(x)) for x in vec) + "]"
 
 
-def _embed_batch(texts: list[str]) -> list[list[float]]:
+def _embed_batch(texts: list[str], model: Optional[str] = None) -> list[list[float]]:
     if not texts:
         return []
     client = _openai()
     embeddings: list[list[float]] = []
     for i in range(0, len(texts), EMBED_BATCH_SIZE):
         batch = texts[i:i + EMBED_BATCH_SIZE]
-        response = client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
+        response = client.embeddings.create(model=model or EMBEDDING_MODEL, input=batch)
         embeddings.extend(item.embedding for item in response.data)
     return embeddings
 
@@ -379,7 +434,179 @@ def _fetch_previous_chunk_embeddings(cur, doc_id: str) -> dict:
     return {row["chunk_hash"]: row["embedding"] for row in cur.fetchall()}
 
 
-# ── Task ──────────────────────────────────────────────────────────────────────
+# ── Ingestion (shared by the upload path and the Re-eval button's re-chunk
+# path — see reevaluate_document below) ─────────────────────────────────────
+
+def _run_ingestion(tenant_id: str, doc_id: str, filename: str, file_bytes: bytes, ingested_by: Optional[str] = None) -> dict:
+    """The actual chunk/embed/diff/supersede pipeline, independent of where
+    file_bytes came from (a fresh upload's base64 payload, or the original
+    already sitting in MinIO for a re-chunk triggered by a chunking-lever
+    adjustment). Reads this tenant's current chunking-lever overrides so a
+    Re-eval-triggered re-chunk actually uses whatever was just adjusted."""
+    ext = _extract_ext(filename)
+
+    minio = _minio()
+    _ensure_bucket(minio, DOC_CHUNKS_BUCKET)
+
+    with get_cursor(commit=True) as cur:
+        version = _next_version(cur, doc_id, tenant_id, filename)
+
+    object_path = f"{tenant_id}/{doc_id}/{version}/original.{ext}"
+    minio.put_object(
+        DOC_CHUNKS_BUCKET, object_path,
+        data=io.BytesIO(file_bytes), length=len(file_bytes),
+    )
+
+    config = get_tenant_pipeline_config(tenant_id, {
+        "max_chunk_tokens":      MAX_CHUNK_TOKENS,
+        "min_chunk_tokens":      MIN_CHUNK_TOKENS,
+        "min_structural_chunks": MIN_STRUCTURAL_CHUNKS,
+    })
+
+    text, page_count = _extract_text(file_bytes, ext)
+    chunks = _enforce_token_bounds(
+        structure_aware_chunks(text, page_count=page_count, min_structural_chunks=config["min_structural_chunks"]),
+        max_chunk_tokens=config["max_chunk_tokens"], min_chunk_tokens=config["min_chunk_tokens"],
+    )
+
+    for i, c in enumerate(chunks):
+        c.chunk_index = i
+        c.chunk_hash  = hashlib.sha256(c.text.encode()).hexdigest()
+
+    with get_cursor() as cur:
+        previous = _fetch_previous_chunk_embeddings(cur, doc_id)
+
+    to_embed = [c for c in chunks if c.chunk_hash not in previous]
+    embeddings = _embed_batch([c.text for c in to_embed])
+    for c, emb in zip(to_embed, embeddings):
+        c.embedding_literal = _format_vector(emb)
+    for c in chunks:
+        if c.chunk_hash in previous:
+            c.embedding_literal = previous[c.chunk_hash]
+
+    with get_cursor(commit=True) as cur:
+        # Supersede the previous version's rows before inserting the new
+        # ones, so this never marks the rows it's about to insert.
+        cur.execute(
+            "UPDATE rag.doc_chunks SET effective_to = now() WHERE doc_id = %s AND effective_to IS NULL",
+            (doc_id,),
+        )
+        for c in chunks:
+            cur.execute(
+                """INSERT INTO rag.doc_chunks
+                     (tenant_id, doc_id, doc_version, section_ref, chunk_index,
+                      chunk_text, chunk_hash, embedding, minio_object_path, ingested_by)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s::vector, %s, %s)""",
+                (tenant_id, doc_id, version, c.section_ref, c.chunk_index,
+                 c.text, c.chunk_hash, c.embedding_literal, object_path, ingested_by),
+            )
+
+    return {
+        "doc_id":          doc_id,
+        "version":         version,
+        "chunk_count":     len(chunks),
+        "chunks_embedded": len(to_embed),
+        "chunks_reused":   len(chunks) - len(to_embed),
+        "minio_object_path": object_path,
+    }
+
+
+# ── Eval (runs after chunking — both right after a normal ingest, if this
+# doc has an eval_set, and from the Re-eval button via reevaluate_document
+# below) ──────────────────────────────────────────────────────────────────
+
+def _score_eval_query(results: list[dict], expected_text_substring: str, expected_section_ref: Optional[str]) -> Optional[int]:
+    """Returns the 1-indexed rank of the first retrieved chunk that matches
+    this query's expected answer, or None if nothing in `results` matches.
+    A match is either the expected substring appearing in the chunk's text
+    (case-insensitive — survives re-chunking, since exact chunk boundaries
+    can shift) or, when given, an exact expected_section_ref match."""
+    substring = expected_text_substring.lower()
+    for rank, r in enumerate(results, start=1):
+        if substring in r["chunk_text"].lower():
+            return rank
+        if expected_section_ref and r.get("section_ref") == expected_section_ref:
+            return rank
+    return None
+
+
+def _compute_eval_metrics(per_query: list[dict]) -> dict:
+    total = len(per_query)
+    hits = [q for q in per_query if q["hit"]]
+    return {
+        "recall_at_k": (len(hits) / total) if total else 0.0,
+        "mrr":         (sum(1.0 / q["rank"] for q in hits) / total) if total else 0.0,
+        "total_queries": total,
+        "top_k": EVAL_TOP_K,
+        "per_query": per_query,
+    }
+
+
+def run_eval(tenant_id: str, doc_id: str) -> dict:
+    """Scores this doc's current eval_set (if any) against real retrieval,
+    using the tenant's current retrieval-lever config, and bypassing the
+    retrieval quota entirely (see rag_service/main.py's _execute_retrieval)
+    — this is platform QA, not tenant usage. Never raises: a failure here
+    (most commonly the same missing-OPENAI_API_KEY that blocks retrieval
+    generally) degrades to a "failed" eval_runs row rather than breaking
+    whatever ingestion task called this as its last step."""
+    try:
+        with get_cursor() as cur:
+            cur.execute(
+                "SELECT version, queries FROM rag.eval_sets WHERE doc_id = %s ORDER BY uploaded_at DESC LIMIT 1",
+                (doc_id,),
+            )
+            eval_set = cur.fetchone()
+    except Exception:
+        eval_set = None
+
+    if eval_set is None:
+        set_eval_status(doc_id, "no_eval_set")
+        return {"status": "no_eval_set"}
+
+    with get_cursor() as cur:
+        cur.execute("SELECT current_version FROM rag.documents WHERE id = %s", (doc_id,))
+        doc_row = cur.fetchone()
+    doc_version = doc_row["current_version"] if doc_row else None
+
+    # Recorded alongside the metrics purely for the report — lets a human
+    # see exactly which lever values produced a given recall@k/MRR without
+    # cross-referencing rag.tenant_pipeline_config separately.
+    lever_snapshot = get_tenant_pipeline_config(tenant_id, {
+        "max_chunk_tokens": MAX_CHUNK_TOKENS, "min_chunk_tokens": MIN_CHUNK_TOKENS,
+        "min_structural_chunks": MIN_STRUCTURAL_CHUNKS,
+        "rrf_k": 60, "candidate_limit": 20,   # mirrors rag_service/main.py's RRF_K/RETRIEVAL_CANDIDATE_LIMIT
+    })
+
+    try:
+        from rag_service.main import _execute_retrieval   # deferred: main.py imports this module at load time
+        per_query = []
+        for item in eval_set["queries"]:
+            results = _execute_retrieval(tenant_id, item["query"], top_k=EVAL_TOP_K)
+            rank = _score_eval_query(results, item["expected_text_substring"], item.get("expected_section_ref"))
+            per_query.append({"query": item["query"], "hit": rank is not None, "rank": rank})
+    except Exception as e:
+        with get_cursor(commit=True) as cur:
+            cur.execute(
+                """INSERT INTO rag.eval_runs (tenant_id, doc_id, doc_version, eval_set_version, status, error, lever_snapshot)
+                   VALUES (%s, %s, %s, %s, 'failed', %s, %s::jsonb)""",
+                (tenant_id, doc_id, doc_version, eval_set["version"], str(e), json.dumps(lever_snapshot)),
+            )
+        set_eval_status(doc_id, "failed", error=str(e))
+        return {"status": "failed", "error": str(e)}
+
+    metrics = _compute_eval_metrics(per_query)
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            """INSERT INTO rag.eval_runs (tenant_id, doc_id, doc_version, eval_set_version, status, metrics, lever_snapshot)
+               VALUES (%s, %s, %s, %s, 'complete', %s::jsonb, %s::jsonb)""",
+            (tenant_id, doc_id, doc_version, eval_set["version"], json.dumps(metrics), json.dumps(lever_snapshot)),
+        )
+    set_eval_status(doc_id, "complete")
+    return {"status": "complete", "metrics": metrics}
+
+
+# ── Tasks ─────────────────────────────────────────────────────────────────────
 
 @celery_app.task(name="ingest_document", bind=True, max_retries=2)
 def ingest_document(
@@ -397,65 +624,54 @@ def ingest_document(
     """
     set_ingest_status(doc_id, "processing")
     try:
-        ext        = _extract_ext(filename)
-        file_bytes = base64.b64decode(file_b64)
-
-        minio = _minio()
-        _ensure_bucket(minio, DOC_CHUNKS_BUCKET)
-
-        with get_cursor(commit=True) as cur:
-            version = _next_version(cur, doc_id, tenant_id, filename)
-
-        object_path = f"{tenant_id}/{doc_id}/{version}/original.{ext}"
-        minio.put_object(
-            DOC_CHUNKS_BUCKET, object_path,
-            data=io.BytesIO(file_bytes), length=len(file_bytes),
-        )
-
-        text, page_count = _extract_text(file_bytes, ext)
-        chunks = _enforce_token_bounds(structure_aware_chunks(text, page_count=page_count))
-
-        for i, c in enumerate(chunks):
-            c.chunk_index = i
-            c.chunk_hash  = hashlib.sha256(c.text.encode()).hexdigest()
-
-        with get_cursor() as cur:
-            previous = _fetch_previous_chunk_embeddings(cur, doc_id)
-
-        to_embed = [c for c in chunks if c.chunk_hash not in previous]
-        embeddings = _embed_batch([c.text for c in to_embed])
-        for c, emb in zip(to_embed, embeddings):
-            c.embedding_literal = _format_vector(emb)
-        for c in chunks:
-            if c.chunk_hash in previous:
-                c.embedding_literal = previous[c.chunk_hash]
-
-        with get_cursor(commit=True) as cur:
-            # Supersede the previous version's rows before inserting the new
-            # ones, so this never marks the rows it's about to insert.
-            cur.execute(
-                "UPDATE rag.doc_chunks SET effective_to = now() WHERE doc_id = %s AND effective_to IS NULL",
-                (doc_id,),
-            )
-            for c in chunks:
-                cur.execute(
-                    """INSERT INTO rag.doc_chunks
-                         (tenant_id, doc_id, doc_version, section_ref, chunk_index,
-                          chunk_text, chunk_hash, embedding, minio_object_path, ingested_by)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s::vector, %s, %s)""",
-                    (tenant_id, doc_id, version, c.section_ref, c.chunk_index,
-                     c.text, c.chunk_hash, c.embedding_literal, object_path, ingested_by),
-                )
+        result = _run_ingestion(tenant_id, doc_id, filename, base64.b64decode(file_b64), ingested_by)
     except Exception as e:
         set_ingest_status(doc_id, "failed", error=str(e))
         raise
 
     set_ingest_status(doc_id, "complete")
-    return {
-        "doc_id":          doc_id,
-        "version":         version,
-        "chunk_count":     len(chunks),
-        "chunks_embedded": len(to_embed),
-        "chunks_reused":   len(chunks) - len(to_embed),
-        "minio_object_path": object_path,
-    }
+
+    # Best-effort — an eval failure (or simply no eval_set for this doc)
+    # must never turn a successful ingest into a reported failure. run_eval
+    # itself is exception-safe, but a second layer here costs nothing.
+    try:
+        run_eval(tenant_id, doc_id)
+    except Exception:
+        pass
+
+    return result
+
+
+@celery_app.task(name="reevaluate_document", bind=True, max_retries=1)
+def reevaluate_document(self, tenant_id: str, doc_id: str, rechunk: bool = False):
+    """Triggered by the frontend's Re-eval button (POST /v1/documents/{doc_id}/eval)
+    after any lever-input changes have already been persisted to
+    rag.tenant_pipeline_config. Only re-chunks (and therefore re-embeds) when
+    a chunking-time lever changed — a query-time-only adjustment (RRF_K,
+    candidate_limit) just re-scores the document's current chunks."""
+    set_eval_status(doc_id, "processing")
+    try:
+        if rechunk:
+            with get_cursor() as cur:
+                cur.execute("SELECT filename, current_version FROM rag.documents WHERE id = %s", (doc_id,))
+                doc_row = cur.fetchone()
+            if doc_row is None:
+                raise ValueError(f"Document {doc_id} not found")
+
+            ext = _extract_ext(doc_row["filename"])
+            object_path = f"{tenant_id}/{doc_id}/{doc_row['current_version']}/original.{ext}"
+            minio = _minio()
+            response = minio.get_object(DOC_CHUNKS_BUCKET, object_path)
+            try:
+                file_bytes = response.read()
+            finally:
+                response.close()
+                response.release_conn()
+
+            _run_ingestion(tenant_id, doc_id, doc_row["filename"], file_bytes, ingested_by=tenant_id)
+
+        result = run_eval(tenant_id, doc_id)
+    except Exception as e:
+        set_eval_status(doc_id, "failed", error=str(e))
+        raise
+    return result

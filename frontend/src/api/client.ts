@@ -97,8 +97,16 @@ export function apiPost<T>(path: string, body?: unknown, baseUrl?: string): Prom
   });
 }
 
-export function apiUpload<T>(path: string, file: File, baseUrl?: string): Promise<T> {
+export function apiUpload<T>(
+  path: string,
+  file: File,
+  baseUrl?: string,
+  extraFields?: Record<string, string>,
+): Promise<T> {
   const formData = new FormData();
   formData.append("file", file);
+  for (const [key, value] of Object.entries(extraFields ?? {})) {
+    formData.append(key, value);
+  }
   return apiFetch<T>(path, { method: "POST", body: formData, baseUrl });
 }

@@ -606,6 +606,69 @@ label {
   max-width: none;
 }
 
+.eval-set-input {
+  margin: -0.5rem 0 1.2rem;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+.eval-set-input summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-weight: 500;
+}
+.eval-set-input textarea {
+  width: 100%;
+  max-width: 640px;
+  font-family: monospace;
+  font-size: 0.8rem;
+  margin-top: 0.5rem;
+}
+
+.muted {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.link-button {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  font-size: 0.82rem;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.lever-row td {
+  background: var(--bg-subtle);
+}
+.lever-panel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 1.5rem;
+  padding: 0.4rem 0;
+}
+.lever-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+  align-items: flex-end;
+}
+.lever-group-label {
+  flex-basis: 100%;
+  margin: 0 0 0.3rem;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+.lever-panel label {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+.lever-panel input {
+  width: 110px;
+}
+
 /* ── Plans ──────────────────────────────────────────────────────────────── */
 
 .plan-tag {
