@@ -152,12 +152,11 @@ export default function Policies() {
 
   async function handleUpload(e: FormEvent) {
     e.preventDefault();
-    if (!file) return;
+    if (!file || !evalSetText.trim()) return;
     setError(null);
     setUploading(true);
     try {
-      const extraFields = evalSetText.trim() ? { eval_set: evalSetText.trim() } : undefined;
-      await apiUpload<UploadResponse>("/v1/documents", file, RAG_SERVICE_BASE_URL, extraFields);
+      await apiUpload<UploadResponse>("/v1/documents", file, RAG_SERVICE_BASE_URL, { eval_set: evalSetText.trim() });
       setFile(null);
       setEvalSetText("");
       await loadDocs();
@@ -206,24 +205,27 @@ export default function Policies() {
 
       <form onSubmit={handleUpload} className="upload-form">
         <input type="file" accept=".pdf,.docx,.md,.txt" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
-        <button type="submit" disabled={!file || uploading}>
+        <div className="eval-set-input">
+          <label>
+            Ground-truth queries (required)
+            <textarea
+              required
+              rows={4}
+              placeholder='[{"query": "collateral requirements", "expected_text_substring": "collateral"}]'
+              value={evalSetText}
+              onChange={(e) => setEvalSetText(e.target.value)}
+            />
+          </label>
+          <p>
+            JSON array of <code>{"{query, expected_text_substring, expected_section_ref?}"}</code>. Every document
+            needs this — it's what scores retrieval quality (recall@k, MRR) right after ingestion, and again any
+            time you click Re-eval below.
+          </p>
+        </div>
+        <button type="submit" disabled={!file || !evalSetText.trim() || uploading}>
           {uploading ? "Uploading..." : "Upload document"}
         </button>
       </form>
-      <details className="eval-set-input">
-        <summary>Optional: attach ground-truth queries (eval_set) for a retrieval-quality report</summary>
-        <p>
-          JSON array of <code>{"{query, expected_text_substring, expected_section_ref?}"}</code>. Used to score
-          this document's retrieval quality (recall@k, MRR) right after ingestion, and again any time you click
-          Re-eval below.
-        </p>
-        <textarea
-          rows={4}
-          placeholder='[{"query": "collateral requirements", "expected_text_substring": "collateral"}]'
-          value={evalSetText}
-          onChange={(e) => setEvalSetText(e.target.value)}
-        />
-      </details>
       {error && <p className="error">{error}</p>}
 
       {usage && (

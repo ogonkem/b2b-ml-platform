@@ -40,6 +40,11 @@ client = TestClient(app)
 TENANT_A = "token-tenant-a"
 TENANT_B = "token-tenant-b"
 
+# eval_set is a required upload field (rag_service/main.py) — a placeholder
+# value here for every test that isn't specifically exercising eval_set
+# validation itself (see TestUploadDocument's dedicated eval_set tests).
+DEFAULT_EVAL_SET = '[{"query": "x", "expected_text_substring": "x"}]'
+
 from app.auth import VALID_TOKENS
 VALID_TOKENS.update({TENANT_A, TENANT_B})
 
@@ -86,6 +91,7 @@ class FakeCursor:
     def __init__(self, chunks=None, documents=None):
         self.chunks = chunks or []
         self.documents = documents or {}
+        self.eval_sets = []  # every upload writes one (eval_set is a required field)
         self.rowcount = 0
         self._result = []
 
@@ -129,6 +135,15 @@ class FakeCursor:
             for c in matched:
                 c["effective_to"] = "now"
             self.rowcount = len(matched)
+
+        elif q.startswith("SELECT EVAL_HASH, VERSION FROM RAG.EVAL_SETS"):
+            (doc_id,) = params
+            matches = [e for e in self.eval_sets if e["doc_id"] == doc_id]
+            self._result = [matches[-1]] if matches else []
+
+        elif q.startswith("INSERT INTO RAG.EVAL_SETS"):
+            tenant_id, doc_id, version, eval_hash, _queries_json = params
+            self.eval_sets.append({"tenant_id": tenant_id, "doc_id": doc_id, "version": version, "eval_hash": eval_hash})
 
         else:
             raise AssertionError(f"Unexpected query in FakeCursor: {query!r}")
@@ -386,6 +401,7 @@ class TestUploadDocument:
             fake_celery.send_task.return_value = fake_task
             resp = client.post(
                 "/v1/documents",
+                data={"eval_set": DEFAULT_EVAL_SET},
                 files={"file": ("policy.md", b"# Title\n\nBody text.", "text/markdown")},
                 headers={"Authorization": f"Bearer {TENANT_A}"},
             )
@@ -407,6 +423,7 @@ class TestUploadDocument:
              patch("rag_service.main._celery_app") as fake_celery:
             resp = client.post(
                 "/v1/documents",
+                data={"eval_set": DEFAULT_EVAL_SET},
                 files={"file": ("data.csv", b"a,b,c", "text/csv")},
                 headers={"Authorization": f"Bearer {TENANT_A}"},
             )
@@ -419,6 +436,7 @@ class TestUploadDocument:
              patch("rag_service.main._celery_app") as fake_celery:
             resp = client.post(
                 "/v1/documents",
+                data={"eval_set": DEFAULT_EVAL_SET},
                 files={"file": ("policy.md", b"", "text/markdown")},
                 headers={"Authorization": f"Bearer {TENANT_A}"},
             )
@@ -431,7 +449,7 @@ class TestUploadDocument:
              patch("rag_service.main._celery_app") as fake_celery:
             resp = client.post(
                 "/v1/documents",
-                data={"doc_id": DOC_B_ID},
+                data={"doc_id": DOC_B_ID, "eval_set": DEFAULT_EVAL_SET},
                 files={"file": ("policy.md", b"content", "text/markdown")},
                 headers={"Authorization": f"Bearer {TENANT_A}"},
             )
@@ -446,7 +464,7 @@ class TestUploadDocument:
             fake_celery.send_task.return_value = fake_task
             resp = client.post(
                 "/v1/documents",
-                data={"doc_id": DOC_A_ID},
+                data={"doc_id": DOC_A_ID, "eval_set": DEFAULT_EVAL_SET},
                 files={"file": ("policy.md", b"content", "text/markdown")},
                 headers={"Authorization": f"Bearer {TENANT_A}"},
             )
@@ -454,7 +472,11 @@ class TestUploadDocument:
         assert resp.json()["doc_id"] == DOC_A_ID
 
     def test_requires_auth(self):
-        resp = client.post("/v1/documents", files={"file": ("policy.md", b"x", "text/markdown")})
+        resp = client.post(
+            "/v1/documents",
+            data={"eval_set": DEFAULT_EVAL_SET},
+            files={"file": ("policy.md", b"x", "text/markdown")},
+        )
         assert resp.status_code == 401
 
     def test_malformed_doc_id_is_rejected_cleanly_not_500(self):
@@ -465,12 +487,23 @@ class TestUploadDocument:
              patch("rag_service.main._celery_app") as fake_celery:
             resp = client.post(
                 "/v1/documents",
-                data={"doc_id": "not-a-uuid"},
+                data={"doc_id": "not-a-uuid", "eval_set": DEFAULT_EVAL_SET},
                 files={"file": ("policy.md", b"content", "text/markdown")},
                 headers={"Authorization": f"Bearer {TENANT_A}"},
             )
         assert resp.status_code == 400
         fake_celery.send_task.assert_not_called()
+
+    def test_rejects_upload_without_eval_set(self):
+        """eval_set is a required Form field now, not optional — FastAPI's
+        own request-validation rejects a missing one with a 422 before the
+        endpoint body ever runs."""
+        resp = client.post(
+            "/v1/documents",
+            files={"file": ("policy.md", b"content", "text/markdown")},
+            headers={"Authorization": f"Bearer {TENANT_A}"},
+        )
+        assert resp.status_code == 422
 
 
 class TestDocumentStatus:
@@ -625,6 +658,7 @@ class TestIngestionQuota:
              p1, p2:
             resp = client.post(
                 "/v1/documents",
+                data={"eval_set": DEFAULT_EVAL_SET},
                 files={"file": ("policy.md", b"content", "text/markdown")},
                 headers={"Authorization": f"Bearer {TENANT_A}"},
             )
@@ -642,6 +676,7 @@ class TestIngestionQuota:
             fake_celery.send_task.return_value = fake_task
             resp = client.post(
                 "/v1/documents",
+                data={"eval_set": DEFAULT_EVAL_SET},
                 files={"file": ("policy.md", b"content", "text/markdown")},
                 headers={"Authorization": f"Bearer {TENANT_A}"},
             )
@@ -655,6 +690,7 @@ class TestIngestionQuota:
              p1, p2:
             resp = client.post(
                 "/v1/documents",
+                data={"eval_set": DEFAULT_EVAL_SET},
                 files={"file": ("policy.md", b"content", "text/markdown")},
                 headers={"Authorization": f"Bearer {TENANT_A}"},
             )
@@ -676,6 +712,7 @@ class TestIngestionQuota:
             fake_celery.send_task.return_value = fake_task
             client.post(
                 "/v1/documents",
+                data={"eval_set": DEFAULT_EVAL_SET},
                 files={"file": ("policy.md", b"content", "text/markdown")},
                 headers={"Authorization": f"Bearer {TENANT_A}"},
             )
@@ -758,10 +795,12 @@ class TestRetrievalQuota:
              patch("rag_service.main._redis", return_value=fake_redis):
             fake_celery.send_task.return_value = fake_task
             # Exhaust the ingestion quota (limit=1) — one upload succeeds...
-            r1 = client.post("/v1/documents", files={"file": ("a.md", b"x", "text/markdown")},
+            r1 = client.post("/v1/documents", data={"eval_set": DEFAULT_EVAL_SET},
+                              files={"file": ("a.md", b"x", "text/markdown")},
                               headers={"Authorization": f"Bearer {TENANT_A}"})
             # ...a second upload is rejected...
-            r2 = client.post("/v1/documents", files={"file": ("b.md", b"y", "text/markdown")},
+            r2 = client.post("/v1/documents", data={"eval_set": DEFAULT_EVAL_SET},
+                              files={"file": ("b.md", b"y", "text/markdown")},
                               headers={"Authorization": f"Bearer {TENANT_A}"})
             # ...but retrieval (limit=1, separate counter) still succeeds.
             r3 = client.post("/v1/retrieve", json={"tenant_id": TENANT_A, "query": "q"},

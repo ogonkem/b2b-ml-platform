@@ -329,10 +329,11 @@ def _store_eval_set_if_changed(tenant_id: str, doc_id: str, queries: list) -> No
 async def upload_document(
     file: UploadFile = File(...),
     doc_id: Optional[str] = Form(None, description="Provide to ingest a new version of an existing document"),
-    eval_set: Optional[str] = Form(
-        None,
-        description='Optional JSON array of {query, expected_text_substring, expected_section_ref?} — '
-                    "ground truth used for this doc's post-ingestion quality report",
+    eval_set: str = Form(
+        ...,
+        description='Required JSON array of {query, expected_text_substring, expected_section_ref?} — '
+                    "ground truth this doc is scored against right after ingestion, and again on every "
+                    "Re-eval. Every document must have one; there is no un-evaluated document.",
     ),
     token: Optional[HTTPAuthorizationCredentials] = Security(security_scheme),
 ):
@@ -366,12 +367,14 @@ async def upload_document(
         if row is not None and row["tenant_id"] != tenant:
             raise HTTPException(status_code=403, detail="doc_id belongs to a different tenant")
 
-    if eval_set is not None:
-        # rag.eval_sets.doc_id has no FK to rag.documents — for a brand-new
-        # doc_id, that row doesn't exist until the ingest task runs, but the
-        # eval_set can be written here regardless (see rag_service/db.py's
-        # schema comment on eval_sets).
-        _store_eval_set_if_changed(tenant, doc_id, _validate_eval_set(eval_set))
+    # rag.eval_sets.doc_id has no FK to rag.documents — for a brand-new
+    # doc_id, that row doesn't exist until the ingest task runs, but the
+    # eval_set can be written here regardless (see rag_service/db.py's
+    # schema comment on eval_sets). Unchanged content on a re-upload is a
+    # no-op (see _store_eval_set_if_changed's hash diffing) — a caller
+    # re-versioning a document isn't forced to hand-author a fresh eval_set
+    # every time.
+    _store_eval_set_if_changed(tenant, doc_id, _validate_eval_set(eval_set))
 
     ingestion_quota, _ = _get_rag_plan_quotas(tenant)
     _check_and_increment_quota(tenant, RAG_INGESTION_QUOTA_PREFIX, "ingestion", increment=1, monthly_limit=ingestion_quota)

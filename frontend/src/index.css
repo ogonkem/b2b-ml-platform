@@ -607,21 +607,24 @@ label {
 }
 
 .eval-set-input {
-  margin: -0.5rem 0 1.2rem;
   font-size: 0.85rem;
   color: var(--text-muted);
 }
-.eval-set-input summary {
-  cursor: pointer;
-  color: var(--accent);
+.eval-set-input label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
   font-weight: 500;
+  color: var(--text);
 }
 .eval-set-input textarea {
   width: 100%;
-  max-width: 640px;
   font-family: monospace;
   font-size: 0.8rem;
-  margin-top: 0.5rem;
+  font-weight: 400;
+}
+.eval-set-input p {
+  margin: 0.4rem 0 0;
 }
 
 .muted {
