@@ -76,30 +76,54 @@ def call_decide(
 
 
 # ── LLM synthesis (the only LLM call in the graph) ──────────────────────────
-# Same provider/tradeoff as rag_service's embeddings (OpenAI text-embedding-
-# 3-small) — see rag_service/ingest_task.py's module docstring for the full
-# external-API discussion, not repeated here. Model choice specifically for
-# this call: a small, cheap chat model is enough because the prompt is
-# heavily grounded (every number it may cite is handed to it verbatim in
-# the prompt — see _build_synthesis_prompt in agent/graph.py) and the
-# output is a short, templated explanation, not open-ended reasoning.
-SYNTHESIS_MODEL = "gpt-4o-mini"
+# Provider-selectable via LLM_PROVIDER: "openai" (real OpenAI), "groq", or
+# "ollama" (local). Groq and Ollama both expose an OpenAI-compatible chat-
+# completions endpoint, so all three are reached through the same `openai`
+# SDK, just pointed at a different base_url/api_key/model — no extra
+# dependency needed. This is independent of rag_service's embeddings
+# (still OpenAI-only, see rag_service/ingest_task.py's module docstring) —
+# swapping the generation provider here does nothing for that separate
+# external-API dependency; a real OPENAI_API_KEY is still required for
+# ingestion/retrieval to work at all, regardless of LLM_PROVIDER.
+#
+# Model choice specifically for this call: a small, cheap chat model is
+# enough because the prompt is heavily grounded (every number it may cite
+# is handed to it verbatim in the prompt — see _build_synthesis_prompt in
+# agent/graph.py) and the output is a short, templated explanation, not
+# open-ended reasoning.
+LLM_PROVIDER      = os.environ.get("LLM_PROVIDER", "openai").lower()
+GROQ_API_KEY      = os.environ.get("GROQ_API_KEY")
+GROQ_LLM_MODEL    = os.environ.get("GROQ_LLM_MODEL", "openai/gpt-oss-20b")
+OLLAMA_BASE_URL   = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_LLM_MODEL  = os.environ.get("OLLAMA_LLM_MODEL", "llama3.2")
+SYNTHESIS_MODEL   = "gpt-4o-mini"   # used only when LLM_PROVIDER == "openai"
 
-_openai_client = None
+_llm_client = None
 
 
-def _openai():
-    global _openai_client
-    if _openai_client is None:
+def _llm():
+    global _llm_client
+    if _llm_client is None:
         from openai import OpenAI
-        _openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    return _openai_client
+        if LLM_PROVIDER == "groq":
+            _llm_client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+        elif LLM_PROVIDER == "ollama":
+            # Ollama's API key is unchecked by the server — the OpenAI SDK
+            # just requires the field to be non-empty.
+            _llm_client = OpenAI(api_key="ollama", base_url=f"{OLLAMA_BASE_URL.rstrip('/')}/v1")
+        else:
+            _llm_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    return _llm_client
+
+
+def _synthesis_model() -> str:
+    return {"groq": GROQ_LLM_MODEL, "ollama": OLLAMA_LLM_MODEL}.get(LLM_PROVIDER, SYNTHESIS_MODEL)
 
 
 def call_llm_synthesis(prompt: str) -> str:
     try:
-        response = _openai().chat.completions.create(
-            model=SYNTHESIS_MODEL,
+        response = _llm().chat.completions.create(
+            model=_synthesis_model(),
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
         )
